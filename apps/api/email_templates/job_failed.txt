@@ -1,0 +1,2 @@
+# TODO M8: job_failed plain-text email template
+{{ subject }}

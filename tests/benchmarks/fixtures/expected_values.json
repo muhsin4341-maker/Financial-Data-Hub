@@ -1,0 +1,14 @@
+{
+  "_comment": "Known-good financial values for extraction accuracy benchmark.",
+  "_status": "TODO M8 — populate with manually-verified values from published filings",
+  "_companies": ["AAPL", "MSFT", "JPM", "TSLA", "WMT"],
+  "AAPL": {
+    "FY2024": {
+      "revenue": 391035000000,
+      "gross_profit": 180683000000,
+      "net_income": 93736000000,
+      "total_assets": 364980000000,
+      "net_cash_from_operations": 118254000000
+    }
+  }
+}

@@ -1,0 +1,91 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO_API: fdh-api
+  ECR_REPO_WEB: fdh-web
+
+jobs:
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fdh
+          POSTGRES_PASSWORD: fdh_password
+          POSTGRES_DB: fdh_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://fdh:fdh_password@localhost:5432/fdh_test
+          REDIS_URL: redis://localhost:6379/0
+          ENVIRONMENT: test
+        run: uv run pytest tests/integration/ -v
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push API image
+        run: |
+          docker build -f infra/Dockerfile.api -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO_API }}:${{ github.sha }} .
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO_API }}:${{ github.sha }}
+
+      - name: Run migrations on staging
+        run: echo "TODO: Run alembic upgrade head on staging DB"
+
+      - name: Deploy to staging EC2
+        run: echo "TODO: SSH to staging EC2, docker compose pull, docker compose up -d"
+
+      - name: Smoke test — health check
+        run: echo "TODO: curl https://staging.api.yourdomain.com/health/ready"
+
+      - name: Smoke test — AAPL job
+        run: echo "TODO: Submit Apple job, verify completion within 5 minutes"

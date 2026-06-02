@@ -1,0 +1,2 @@
+# TODO M8: job_complete plain-text email template
+{{ subject }}

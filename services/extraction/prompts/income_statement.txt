@@ -1,0 +1,3 @@
+# TODO Phase2: Claude API extraction prompt for income statement
+# This prompt will instruct Claude to extract income statement data
+# into the canonical field schema defined in extraction_schema.py

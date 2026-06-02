@@ -1,0 +1,126 @@
+version: "3.9"
+
+x-api-common: &api-common
+  build:
+    context: .
+    dockerfile: infra/Dockerfile.api
+  env_file: .env
+  volumes:
+    - .:/app
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+
+  # ── PostgreSQL 16 ───────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fdh
+      POSTGRES_PASSWORD: fdh_password
+      POSTGRES_DB: fdh
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fdh -d fdh"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Redis 7 ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── LocalStack (S3 emulation) ────────────────────────────────────────────────
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+      DEBUG: 0
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    volumes:
+      - localstack_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:4566/_localstack/health | grep -q '"s3": "available"' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  # ── FastAPI Application ──────────────────────────────────────────────────────
+  api:
+    <<: *api-common
+    command: uvicorn apps.api.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+
+  # ── Celery Workers ───────────────────────────────────────────────────────────
+  worker-fetch:
+    <<: *api-common
+    command: celery -A workers.celery_app worker -Q fetch -c 4 -n fetch@%h --loglevel=info
+
+  worker-ai:
+    <<: *api-common
+    command: celery -A workers.celery_app worker -Q ai -c 3 -n ai@%h --loglevel=info
+
+  worker-compute:
+    <<: *api-common
+    command: celery -A workers.celery_app worker -Q compute -c 8 -n compute@%h --loglevel=info
+
+  worker-export:
+    <<: *api-common
+    command: celery -A workers.celery_app worker -Q export -c 2 -n export@%h --loglevel=info
+
+  # ── Celery Flower (monitoring) ───────────────────────────────────────────────
+  flower:
+    <<: *api-common
+    command: celery -A workers.celery_app flower --port=5555 --broker_api=redis://redis:6379/1
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+
+  # ── Next.js Frontend ─────────────────────────────────────────────────────────
+  web:
+    build:
+      context: apps/web
+      dockerfile: ../../infra/Dockerfile.web
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./apps/web:/app
+      - /app/node_modules
+      - /app/.next
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NODE_ENV: development
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  localstack_data:

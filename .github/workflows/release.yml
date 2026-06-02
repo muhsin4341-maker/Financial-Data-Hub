@@ -1,0 +1,51 @@
+name: Deploy to Production
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag and push release images
+        run: |
+          TAG=${{ github.ref_name }}
+          docker build -f infra/Dockerfile.api -t ${{ steps.login-ecr.outputs.registry }}/fdh-api:$TAG .
+          docker push ${{ steps.login-ecr.outputs.registry }}/fdh-api:$TAG
+
+      - name: Run migrations on production
+        run: echo "TODO: Run alembic upgrade head on production DB"
+
+      - name: Blue-green deploy to production
+        run: echo "TODO: Switch ALB target group to new version"
+
+      - name: Production smoke tests
+        run: echo "TODO: Run AAPL smoke test against production"
+
+      - name: Rollback on failure
+        if: failure()
+        run: echo "TODO: Switch ALB target group back to previous version"
+
+      - name: Notify team
+        if: always()
+        run: echo "TODO: Send Slack/email notification with deploy status"
