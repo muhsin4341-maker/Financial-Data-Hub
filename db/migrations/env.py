@@ -9,10 +9,11 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Import Base metadata from ORM models
-# TODO M1: from apps.api.models import Base
-# target_metadata = Base.metadata
-target_metadata = None   # Replace once models are created in M1
+# Import Base metadata from ORM models — connected in M1
+from apps.api.core.database import Base  # noqa: E402
+import apps.api.models  # noqa: E402, F401 — registers all ORM models on Base.metadata
+
+target_metadata = Base.metadata
 
 # Override sqlalchemy.url from environment variable
 database_url = os.environ.get("DATABASE_URL_SYNC", "")
