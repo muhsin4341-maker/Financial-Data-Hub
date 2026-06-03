@@ -5,7 +5,6 @@ Milestone: M1-Step11
 Loads all settings from environment variables / .env file.
 """
 from functools import lru_cache
-from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -92,13 +91,13 @@ class Settings(BaseSettings):
     sentry_dsn: str = ""
     prometheus_metrics_port: int = 9090
 
-    # CORS
+    # CORS — stored as comma-separated string; use .cors_origins property for list
     allowed_origins: str = "http://localhost:3000"
 
-    @field_validator("allowed_origins", mode="before")
-    @classmethod
-    def parse_origins(cls, v: str) -> list[str]:
-        return [o.strip() for o in v.split(",")]
+    @property
+    def cors_origins(self) -> list[str]:
+        """Returns allowed origins as a list for use in CORSMiddleware."""
+        return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
 
     @property
     def is_production(self) -> bool:
