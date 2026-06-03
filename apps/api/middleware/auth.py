@@ -42,7 +42,7 @@ Status:    COMPLETE
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import structlog
@@ -154,7 +154,11 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
         super().__init__(app)  # type: ignore[arg-type]
         self._settings = settings  # None → resolved lazily per request
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
         # ── 1. Assign a unique request ID for end-to-end tracing ─────────────
         request_id = str(uuid.uuid4())
         request.state.request_id = request_id
