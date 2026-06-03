@@ -22,6 +22,7 @@ from apps.api.core.exceptions import APIError, api_error_handler
 from apps.api.middleware.audit import AuditMiddleware
 from apps.api.middleware.auth import JWTAuthMiddleware
 from apps.api.middleware.rate_limit import RateLimitMiddleware
+from apps.api.routers.auth import router as auth_router
 
 log = structlog.get_logger(__name__)
 
@@ -170,7 +171,7 @@ def create_app() -> FastAPI:
         }
 
     # ── Routers (added per milestone) ────────────────────────────────────────
-    # TODO M1-Steps 17-23: include auth router
+    app.include_router(auth_router)   # M1-Steps 18-23
     # TODO M2: include companies router
     # TODO M2: include jobs router
     # TODO M6: include exports router
