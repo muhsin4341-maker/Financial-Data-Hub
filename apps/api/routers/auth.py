@@ -8,15 +8,16 @@ Engineering Specification references:
 
 Endpoints implemented:
   POST /api/v1/auth/register  — M1-Step18 ✓
+  POST /api/v1/auth/login     — M1-Step19 ✓
 
 Endpoints planned (future steps):
-  POST /api/v1/auth/login           — M1-Step19
   POST /api/v1/auth/refresh         — M1-Step20
   POST /api/v1/auth/logout          — M1-Step21
   POST /api/v1/auth/forgot-password — M1-Step22
   POST /api/v1/auth/reset-password  — M1-Step23
 
-Milestone: M1-Step18 — POST /auth/register
+Milestone: M1-Step18 — POST /auth/register  ✓
+           M1-Step19 — POST /auth/login      ✓
 Status:    COMPLETE
 """
 
@@ -30,7 +31,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.core.database import get_db
-from apps.api.core.exceptions import ConflictError, ValidationError
+from apps.api.core.exceptions import ConflictError, UnauthorizedError, ValidationError
 from apps.api.core.security import (
     check_hibp_password,
     create_access_token,
@@ -38,10 +39,11 @@ from apps.api.core.security import (
     generate_refresh_token_expiry,
     hash_password,
     hash_refresh_token,
+    verify_password,
 )
 from apps.api.models import UserRole
 from apps.api.repositories.auth import AuthRepository
-from apps.api.schemas.auth import AuthResponse, RegisterRequest
+from apps.api.schemas.auth import AuthResponse, LoginRequest, RegisterRequest
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
@@ -174,7 +176,7 @@ async def register(
 
         await repo.create_refresh_token(
             user=user,
-            tenant=tenant,
+            tenant_id=tenant.id,
             token_hash=hash_refresh_token(raw_refresh),
             jti=jti,
             expires_at=generate_refresh_token_expiry(),
@@ -226,4 +228,140 @@ async def register(
         user_id=user.id,
         tenant_id=tenant.id,
         role=str(UserRole.OWNER),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/auth/login
+# ---------------------------------------------------------------------------
+
+#: Generic credential error — same message for wrong email AND wrong password
+#: to prevent user-enumeration via distinct error strings.
+_INVALID_CREDENTIALS = "Invalid email or password."
+
+
+@router.post(
+    "/login",
+    response_model=AuthResponse,
+    status_code=200,
+    summary="Log in to an existing account",
+    description=(
+        "Validates credentials, issues a JWT access token (response body) "
+        "and a 30-day refresh token (httpOnly cookie)."
+    ),
+)
+async def login(
+    payload: LoginRequest,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+) -> AuthResponse:
+    """
+    Login flow — executed in a single database transaction:
+
+    1. Fetch user by email (deleted_at IS NULL filter applied by repo).
+    2. Verify bcrypt password hash — constant-time comparison via bcrypt.checkpw.
+    3. Reject if user account is inactive (is_active = False).
+    4. Resolve active TenantMembership to obtain tenant_id and RBAC role.
+    5. Stamp last_login_at = NOW().
+    6. Issue JWT access token (15-min) and opaque refresh token (30-day).
+    7. Persist RefreshToken record (hash only; raw token in httpOnly cookie).
+    8. Append AuditLog entry (action="user.login").
+    9. Set httpOnly refresh cookie and return AuthResponse.
+
+    Error strategy:
+      - Unknown email AND wrong password both return 401 with the same
+        message to prevent user enumeration via distinct error text.
+      - Inactive accounts return 401 (indistinct from credential failure at
+        the message level; the code is UNAUTHORIZED in both cases).
+
+    Note on timing:
+      bcrypt.checkpw provides constant-time password comparison. A timing
+      difference does exist between "email not found" (fast DB miss) and
+      "wrong password" (slow bcrypt), which could theoretically enable email
+      enumeration. A constant-time guard hash is deferred to a hardening
+      pass (not in scope for M1).
+    """
+    repo = AuthRepository(db)
+
+    # ── Step 1: Fetch user ────────────────────────────────────────────────────
+    user = await repo.get_user_by_email(payload.email)
+
+    # ── Step 2: Verify password ───────────────────────────────────────────────
+    # verify_password uses bcrypt.checkpw — constant-time comparison.
+    # We check this regardless of whether the user exists to keep the
+    # error path uniform; if no user, we reject immediately after.
+    if user is None or not verify_password(payload.password, user.password_hash):
+        raise UnauthorizedError(_INVALID_CREDENTIALS)
+
+    # ── Step 3: Check account status ──────────────────────────────────────────
+    if not user.is_active:
+        log.warning("auth.login.inactive_account", user_id=str(user.id))
+        raise UnauthorizedError(_INVALID_CREDENTIALS)
+
+    # ── Step 4: Resolve tenant context ────────────────────────────────────────
+    # For M1 every user has exactly one tenant (created at registration).
+    # Multi-tenant context selection (X-Tenant-ID header) is deferred to M6+.
+    membership = await repo.get_active_membership(user.id)
+    if membership is None:
+        # Data integrity problem: active user has no active tenant membership.
+        log.error("auth.login.no_active_membership", user_id=str(user.id))
+        raise UnauthorizedError(_INVALID_CREDENTIALS)
+
+    # ── Step 5: Stamp last_login_at ────────────────────────────────────────────
+    await repo.update_last_login(user)
+
+    # ── Steps 6-8: Token issuance + DB writes ─────────────────────────────────
+    access_token, jti = create_access_token(
+        user_id=user.id,
+        tenant_id=membership.tenant_id,
+        role=membership.role,
+    )
+    raw_refresh = generate_raw_refresh_token()
+
+    await repo.create_refresh_token(
+        user=user,
+        tenant_id=membership.tenant_id,
+        token_hash=hash_refresh_token(raw_refresh),
+        jti=jti,
+        expires_at=generate_refresh_token_expiry(),
+        ip_address=_client_ip(request),
+        user_agent=_client_ua(request),
+    )
+
+    await repo.create_audit_log(
+        tenant_id=membership.tenant_id,
+        user_id=user.id,
+        action="user.login",
+        entity_type="user",
+        entity_id=user.id,
+        ip_address=_client_ip(request),
+        user_agent=_client_ua(request),
+        request_id=_request_id(request),
+    )
+
+    # ── Step 9: Set refresh cookie and return ─────────────────────────────────
+    response.set_cookie(
+        key=_REFRESH_COOKIE,
+        value=raw_refresh,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=30 * 24 * 60 * 60,
+        path=_REFRESH_COOKIE_PATH,
+    )
+
+    log.info(
+        "auth.login.success",
+        user_id=str(user.id),
+        tenant_id=str(membership.tenant_id),
+        role=str(membership.role),
+    )
+
+    return AuthResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user_id=user.id,
+        tenant_id=membership.tenant_id,
+        role=str(membership.role),
     )

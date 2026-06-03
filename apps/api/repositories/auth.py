@@ -15,7 +15,8 @@ Repository contract:
   - The session is never committed here; the caller (route handler + get_db
     dependency) owns the transaction boundary.
 
-Milestone: M1-Step18 — POST /auth/register
+Milestone: M1-Step18 — POST /auth/register  ✓
+           M1-Step19 — POST /auth/login      ✓
 Status:    COMPLETE
 """
 
@@ -104,6 +105,49 @@ class AuthRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_active_membership(self, user_id: uuid.UUID) -> TenantMembership | None:
+        """
+        Return the user's first active TenantMembership.
+
+        For M1, each registered user has exactly one tenant. This query is
+        structured to support future multi-tenant context selection (e.g. via
+        a ``X-Tenant-ID`` header) without schema changes.
+
+        Args:
+            user_id: Primary key of the authenticated user.
+
+        Returns:
+            Active ``TenantMembership`` instance, or ``None`` if the user has
+            no active tenant context (deactivated membership or data integrity
+            issue — both result in a 401 at the call site).
+        """
+        result = await self._session.execute(
+            select(TenantMembership)
+            .where(
+                TenantMembership.user_id == user_id,
+                TenantMembership.is_active.is_(True),
+                TenantMembership.deleted_at.is_(None),
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def update_last_login(self, user: User) -> None:
+        """
+        Stamp the user's ``last_login_at`` to the current UTC time.
+
+        Called on every successful login. The ``User`` ORM instance must
+        already be attached to the current session (loaded by
+        ``get_user_by_email``); the change is committed atomically with the
+        rest of the login transaction.
+
+        Args:
+            user: The authenticated user whose timestamp is to be updated.
+        """
+        user.last_login_at = datetime.now(UTC)
+        # Flush so the UPDATE is part of this transaction's write set.
+        await self._session.flush([user])
+
     # ── Creation ─────────────────────────────────────────────────────────────
 
     async def create_tenant(self, name: str) -> Tenant:
@@ -187,7 +231,7 @@ class AuthRepository:
     async def create_refresh_token(
         self,
         user: User,
-        tenant: Tenant,
+        tenant_id: uuid.UUID,
         token_hash: str,
         jti: str,
         expires_at: datetime,
@@ -203,7 +247,9 @@ class AuthRepository:
 
         Args:
             user:        Token owner.
-            tenant:      Tenant context at issuance.
+            tenant_id:   UUID of the tenant context at issuance. Accepting
+                         ``uuid.UUID`` directly avoids loading the full Tenant
+                         ORM object when only the ID is needed (e.g. login).
             token_hash:  SHA-256 hex digest of the raw opaque token.
             jti:         JWT ID from the paired access token — used as the Redis
                          blocklist key on logout / rotation.
@@ -216,7 +262,7 @@ class AuthRepository:
         """
         token = RefreshToken(
             user_id=user.id,
-            tenant_id=tenant.id,
+            tenant_id=tenant_id,
             token_hash=token_hash,
             jti=jti,
             expires_at=expires_at,

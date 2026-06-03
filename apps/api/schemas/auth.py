@@ -4,9 +4,10 @@ Auth request/response Pydantic schemas.
 Engineering Specification references:
   Part 2, Section 8.2  — Password policy: 12 chars, uppercase, lowercase, digit, special char
   Part 2, Section 8.3  — JWT response payload: access_token, token_type, user_id, tenant_id, role
-  Part 3, Section 11.3 — POST /auth/register request body
+  Part 3, Section 11.3 — POST /auth/register and POST /auth/login request bodies
 
-Milestone: M1-Step18 — POST /auth/register
+Milestone: M1-Step18 — POST /auth/register  ✓
+           M1-Step19 — POST /auth/login      ✓
 Status:    COMPLETE
 """
 
@@ -66,6 +67,27 @@ class RegisterRequest(BaseModel):
     @classmethod
     def _normalise_email(cls, v: str) -> str:
         """Lowercase the email address for consistent storage and lookup."""
+        return v.lower()
+
+
+class LoginRequest(BaseModel):
+    """
+    Request body for POST /auth/login.
+
+    No password complexity validation — that is only enforced at registration.
+    The email is normalised to lowercase before the database lookup.
+    """
+
+    email: EmailStr = Field(description="Registered email address.")
+    password: str = Field(
+        min_length=1,
+        description="Account password (plaintext; never stored or logged).",
+    )
+
+    @field_validator("email")
+    @classmethod
+    def _normalise_email(cls, v: str) -> str:
+        """Lowercase for consistent lookup against the stored email."""
         return v.lower()
 
 
