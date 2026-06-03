@@ -1,4 +1,4 @@
-name: Deploy to Production
+﻿name: Deploy to Production
 
 on:
   push:
@@ -34,18 +34,19 @@ jobs:
           docker push ${{ steps.login-ecr.outputs.registry }}/fdh-api:$TAG
 
       - name: Run migrations on production
-        run: echo "TODO: Run alembic upgrade head on production DB"
+        run: echo "TODO M8: Run alembic upgrade head on production DB"
 
       - name: Blue-green deploy to production
-        run: echo "TODO: Switch ALB target group to new version"
+        run: echo "TODO M8: Switch ALB target group to new version"
 
       - name: Production smoke tests
-        run: echo "TODO: Run AAPL smoke test against production"
+        run: echo "TODO M8: Run AAPL smoke test against production"
 
       - name: Rollback on failure
         if: failure()
-        run: echo "TODO: Switch ALB target group back to previous version"
+        run: echo "TODO M8: Switch ALB target group back to previous version"
 
       - name: Notify team
         if: always()
-        run: echo "TODO: Send Slack/email notification with deploy status"
+        run: echo "TODO M8: Send Slack/email notification with deploy status"
+

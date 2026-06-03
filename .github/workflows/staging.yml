@@ -1,4 +1,4 @@
-name: Deploy to Staging
+﻿name: Deploy to Staging
 
 on:
   push:
@@ -79,13 +79,14 @@ jobs:
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO_API }}:${{ github.sha }}
 
       - name: Run migrations on staging
-        run: echo "TODO: Run alembic upgrade head on staging DB"
+        run: echo "TODO M8: Run alembic upgrade head on staging DB"
 
       - name: Deploy to staging EC2
-        run: echo "TODO: SSH to staging EC2, docker compose pull, docker compose up -d"
+        run: echo "TODO M8: SSH to staging EC2, docker compose pull, docker compose up -d"
 
-      - name: Smoke test — health check
-        run: echo "TODO: curl https://staging.api.yourdomain.com/health/ready"
+      - name: Smoke test â€” health check
+        run: echo "TODO M8: curl https://staging.api.yourdomain.com/health/ready"
 
-      - name: Smoke test — AAPL job
-        run: echo "TODO: Submit Apple job, verify completion within 5 minutes"
+      - name: Smoke test â€” AAPL job
+        run: echo "TODO M8: Submit Apple job, verify completion within 5 minutes"
+
