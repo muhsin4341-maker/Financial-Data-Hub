@@ -129,7 +129,9 @@ class TokenPayload(BaseModel):
         """jose decodes exp/iat as int (Unix timestamp). Normalise to datetime."""
         if isinstance(v, datetime):
             return v if v.tzinfo else v.replace(tzinfo=UTC)
-        return datetime.fromtimestamp(int(v), tz=UTC)
+        if not isinstance(v, (int, float)):
+            raise ValueError(f"Expected numeric timestamp, got {type(v).__name__!r}")
+        return datetime.fromtimestamp(float(v), tz=UTC)
 
 
 # ---------------------------------------------------------------------------

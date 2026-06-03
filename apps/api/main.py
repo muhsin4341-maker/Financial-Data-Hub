@@ -4,6 +4,7 @@ Financial Data Hub — FastAPI Application Entry Point.
 Milestone: M1 — Foundation Layer
 Status: STUB — business logic not yet implemented.
 """
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -19,7 +20,7 @@ def create_app() -> FastAPI:
         title="Financial Data Hub API",
         version="0.1.0",
         description="Production-grade financial data acquisition and Excel export.",
-        docs_url="/api/v1/docs",       # development only — disable in production
+        docs_url="/api/v1/docs",  # development only — disable in production
         redoc_url="/api/v1/redoc",
         openapi_url="/api/v1/openapi.json",
     )
@@ -27,7 +28,7 @@ def create_app() -> FastAPI:
     # CORS — configured from settings in M1
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000"],   # TODO M1: load from Settings
+        allow_origins=["http://localhost:3000"],  # TODO M1: load from Settings
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

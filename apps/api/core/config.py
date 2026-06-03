@@ -4,7 +4,9 @@ Application configuration via Pydantic Settings v2.
 Milestone: M1-Step11
 Loads all settings from environment variables / .env file.
 """
+
 from functools import lru_cache
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -45,7 +47,7 @@ class Settings(BaseSettings):
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_region: str = "us-east-1"
-    aws_endpoint_url: str | None = None   # None = real AWS; set for LocalStack
+    aws_endpoint_url: str | None = None  # None = real AWS; set for LocalStack
 
     # S3 Buckets
     s3_documents_bucket: str = "fdh-documents-dev"

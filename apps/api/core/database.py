@@ -3,7 +3,9 @@ SQLAlchemy 2.x async database engine and session factory.
 
 Milestone: M1-Step12
 """
+
 from collections.abc import AsyncGenerator
+
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -16,12 +18,13 @@ from sqlalchemy.orm import DeclarativeBase
 
 class Base(DeclarativeBase):
     """SQLAlchemy declarative base — all ORM models inherit from this."""
+
     pass
 
 
 # Engine and session factory (initialised in app lifespan — TODO M1-Step10)
 engine = None
-AsyncSessionFactory: async_sessionmaker | None = None
+AsyncSessionFactory: async_sessionmaker[AsyncSession] | None = None
 
 
 def init_db(database_url: str) -> None:
@@ -29,8 +32,8 @@ def init_db(database_url: str) -> None:
     global engine, AsyncSessionFactory
     engine = create_async_engine(
         database_url,
-        echo=False,        # TODO M1: set echo=settings.debug
-        pool_size=10,      # TODO M1: load from settings
+        echo=False,  # TODO M1: set echo=settings.debug
+        pool_size=10,  # TODO M1: load from settings
         max_overflow=20,
     )
     AsyncSessionFactory = async_sessionmaker(
