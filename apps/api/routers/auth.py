@@ -9,15 +9,16 @@ Engineering Specification references:
 Endpoints implemented:
   POST /api/v1/auth/register  — M1-Step18 ✓
   POST /api/v1/auth/login     — M1-Step19 ✓
+  POST /api/v1/auth/refresh   — M1-Step20 ✓
 
 Endpoints planned (future steps):
-  POST /api/v1/auth/refresh         — M1-Step20
   POST /api/v1/auth/logout          — M1-Step21
   POST /api/v1/auth/forgot-password — M1-Step22
   POST /api/v1/auth/reset-password  — M1-Step23
 
 Milestone: M1-Step18 — POST /auth/register  ✓
            M1-Step19 — POST /auth/login      ✓
+           M1-Step20 — POST /auth/refresh    ✓
 Status:    COMPLETE
 """
 
@@ -26,10 +27,11 @@ from __future__ import annotations
 import uuid
 
 import structlog
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Cookie, Depends, Request, Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core.config import get_settings
 from apps.api.core.database import get_db
 from apps.api.core.exceptions import ConflictError, UnauthorizedError, ValidationError
 from apps.api.core.security import (
@@ -360,6 +362,200 @@ async def login(
 
     return AuthResponse(
         access_token=access_token,
+        token_type="bearer",
+        user_id=user.id,
+        tenant_id=membership.tenant_id,
+        role=str(membership.role),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers — token refresh / logout
+# ---------------------------------------------------------------------------
+
+
+async def _blocklist_jti(jti: str, ttl_seconds: int) -> None:
+    """
+    Write a JWT ID to the Redis blocklist with a TTL.
+
+    Used during token rotation (refresh) and logout to invalidate the old
+    access token before it naturally expires. The JWTAuthMiddleware checks
+    this blocklist before accepting a token (TODO M1-Step21 wires the check).
+
+    Key format: ``blocklist:{jti}``
+    TTL:        Access token lifetime (default 15 min = 900 s) so the key
+                expires automatically when the access token would have anyway.
+
+    Fails open — a Redis outage must not block token rotation. The DB-level
+    ``revoked_at`` flag on the RefreshToken is the authoritative revocation
+    signal; Redis is a fast-path cache to catch in-flight access tokens.
+
+    Args:
+        jti:         JWT ID from the old access token payload.
+        ttl_seconds: Key TTL in seconds — set to the access token expire time.
+    """
+    try:
+        import redis.asyncio as aioredis  # noqa: PLC0415
+
+        settings = get_settings()
+        client: aioredis.Redis = aioredis.from_url(  # type: ignore[no-untyped-call]
+            settings.redis_url,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        await client.setex(f"blocklist:{jti}", ttl_seconds, "1")
+        await client.aclose()
+    except Exception:  # noqa: BLE001 — fail open; DB revoked_at is authoritative
+        log.warning("auth.refresh.blocklist_write_failed", jti=jti)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/auth/refresh
+# ---------------------------------------------------------------------------
+
+#: Generic invalid-token error used for all refresh failure modes to prevent
+#: enumeration of token state (expired vs revoked vs not found).
+_INVALID_TOKEN = "Refresh token is invalid or has expired."
+
+
+@router.post(
+    "/refresh",
+    response_model=AuthResponse,
+    status_code=200,
+    summary="Rotate refresh token and issue new access token",
+    description=(
+        "Reads the ``fdh_refresh`` httpOnly cookie, validates the refresh "
+        "token, and performs full token rotation: the old token is revoked, "
+        "a new refresh token is issued (cookie updated), and a new JWT access "
+        "token is returned in the response body."
+    ),
+)
+async def refresh(
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+    fdh_refresh: str | None = Cookie(default=None),
+) -> AuthResponse:
+    """
+    Token rotation flow — Engineering Spec Part 2, Section 8.2, Decision 1:
+      "Refresh token rotation on every use — revoke old token, issue new one."
+
+    Steps:
+      1. Read raw refresh token from ``fdh_refresh`` cookie → 401 if absent.
+      2. Hash it and look up the RefreshToken record → 401 if not found.
+      3. Validate ``token.is_valid`` (not revoked, not expired) → 401 if invalid.
+      4. Load the associated user → 401 if deleted or inactive.
+      5. Load the user's active TenantMembership → 401 if none.
+      6. Revoke the old RefreshToken (set ``revoked_at``).
+      7. Issue new access token + new refresh token.
+      8. Persist new RefreshToken record.
+      9. Append AuditLog entry (action="user.token_refresh").
+     10. Write old ``jti`` to Redis blocklist (TTL = access token lifetime,
+         fail-open — Redis outage must not block rotation).
+     11. Set new ``fdh_refresh`` cookie and return AuthResponse.
+
+    Security: all failure modes return the same 401 message to prevent
+    callers from distinguishing "not found" from "revoked" from "expired".
+    """
+    repo = AuthRepository(db)
+
+    # ── Step 1: Cookie presence ───────────────────────────────────────────────
+    if not fdh_refresh:
+        raise UnauthorizedError(_INVALID_TOKEN)
+
+    # ── Step 2: Look up token record ──────────────────────────────────────────
+    token_hash = hash_refresh_token(fdh_refresh)
+    stored_token = await repo.get_refresh_token_by_hash(token_hash)
+    if stored_token is None:
+        raise UnauthorizedError(_INVALID_TOKEN)
+
+    # ── Step 3: Validate token state ──────────────────────────────────────────
+    # is_valid = revoked_at is None AND now < expires_at
+    if not stored_token.is_valid:
+        log.warning(
+            "auth.refresh.invalid_token",
+            token_id=str(stored_token.id),
+            revoked=stored_token.revoked_at is not None,
+        )
+        raise UnauthorizedError(_INVALID_TOKEN)
+
+    # ── Step 4: Verify user still active ─────────────────────────────────────
+    user = await repo.get_user_by_id(stored_token.user_id)
+    if user is None or not user.is_active:
+        log.warning("auth.refresh.user_invalid", user_id=str(stored_token.user_id))
+        raise UnauthorizedError(_INVALID_TOKEN)
+
+    # ── Step 5: Resolve tenant context ────────────────────────────────────────
+    membership = await repo.get_active_membership(user.id)
+    if membership is None:
+        log.error("auth.refresh.no_active_membership", user_id=str(user.id))
+        raise UnauthorizedError(_INVALID_TOKEN)
+
+    # Capture old jti before rotation (needed for Redis blocklist).
+    old_jti = stored_token.jti
+
+    # ── Steps 6–9: Atomic writes ──────────────────────────────────────────────
+    await repo.revoke_refresh_token(stored_token)
+
+    new_access_token, new_jti = create_access_token(
+        user_id=user.id,
+        tenant_id=membership.tenant_id,
+        role=membership.role,
+    )
+    new_raw_refresh = generate_raw_refresh_token()
+
+    await repo.create_refresh_token(
+        user=user,
+        tenant_id=membership.tenant_id,
+        token_hash=hash_refresh_token(new_raw_refresh),
+        jti=new_jti,
+        expires_at=generate_refresh_token_expiry(),
+        ip_address=_client_ip(request),
+        user_agent=_client_ua(request),
+    )
+
+    await repo.create_audit_log(
+        tenant_id=membership.tenant_id,
+        user_id=user.id,
+        action="user.token_refresh",
+        entity_type="user",
+        entity_id=user.id,
+        ip_address=_client_ip(request),
+        user_agent=_client_ua(request),
+        request_id=_request_id(request),
+    )
+
+    # ── Step 10: Blocklist old jti in Redis (fail-open) ───────────────────────
+    # Wrapped in try/except so any unexpected propagation from _blocklist_jti
+    # (e.g. in tests replacing it with a raising stub) cannot abort rotation.
+    try:
+        settings = get_settings()
+        await _blocklist_jti(
+            jti=old_jti,
+            ttl_seconds=settings.jwt_access_token_expire_minutes * 60,
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("auth.refresh.blocklist_error", jti=old_jti)
+
+    # ── Step 11: Set new cookie and return ────────────────────────────────────
+    response.set_cookie(
+        key=_REFRESH_COOKIE,
+        value=new_raw_refresh,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=30 * 24 * 60 * 60,
+        path=_REFRESH_COOKIE_PATH,
+    )
+
+    log.info(
+        "auth.refresh.success",
+        user_id=str(user.id),
+        tenant_id=str(membership.tenant_id),
+    )
+
+    return AuthResponse(
+        access_token=new_access_token,
         token_type="bearer",
         user_id=user.id,
         tenant_id=membership.tenant_id,

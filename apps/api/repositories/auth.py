@@ -17,6 +17,7 @@ Repository contract:
 
 Milestone: M1-Step18 — POST /auth/register  ✓
            M1-Step19 — POST /auth/login      ✓
+           M1-Step20 — POST /auth/refresh    ✓
 Status:    COMPLETE
 """
 
@@ -104,6 +105,65 @@ class AuthRepository:
             )
         )
         return result.scalar_one_or_none()
+
+    async def get_user_by_id(self, user_id: uuid.UUID) -> User | None:
+        """
+        Fetch an active (non-deleted) user by primary key.
+
+        Used during token refresh to verify the user still exists and has
+        not been soft-deleted since the original token was issued.
+
+        Args:
+            user_id: UUID primary key of the user to look up.
+
+        Returns:
+            ``User`` ORM instance if found and not deleted, ``None`` otherwise.
+        """
+        result = await self._session.execute(
+            select(User).where(
+                User.id == user_id,
+                User.deleted_at.is_(None),
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_refresh_token_by_hash(self, token_hash: str) -> RefreshToken | None:
+        """
+        Look up a refresh token record by its SHA-256 hash.
+
+        The unique index on ``refresh_tokens.token_hash`` makes this an
+        efficient single-row lookup. The raw token NEVER reaches this layer —
+        only its hash is passed.
+
+        Args:
+            token_hash: SHA-256 hex digest of the raw opaque token from the
+                        ``fdh_refresh`` cookie.
+
+        Returns:
+            ``RefreshToken`` ORM instance if found, ``None`` otherwise.
+        """
+        result = await self._session.execute(
+            select(RefreshToken).where(RefreshToken.token_hash == token_hash)
+        )
+        return result.scalar_one_or_none()
+
+    async def revoke_refresh_token(self, token: RefreshToken) -> None:
+        """
+        Mark a refresh token as consumed by setting ``revoked_at = NOW()``.
+
+        Called during token rotation (refresh) and logout. A non-NULL
+        ``revoked_at`` means the token has been consumed. Re-use of a
+        revoked token indicates a potential token theft and should be
+        treated as a security event.
+
+        The token object must already be attached to the current session
+        (loaded by ``get_refresh_token_by_hash``).
+
+        Args:
+            token: The ``RefreshToken`` record to revoke.
+        """
+        token.revoked_at = datetime.now(UTC)
+        await self._session.flush([token])
 
     async def get_active_membership(self, user_id: uuid.UUID) -> TenantMembership | None:
         """
