@@ -22,9 +22,17 @@ Implementation note — passlib compatibility:
   code reads `bcrypt.__about__.__version__` which no longer exists in bcrypt 5.x).
   The installed stack has bcrypt 5.0.0. This module therefore wraps the `bcrypt`
   package directly, providing an identical public API to what passlib would expose.
-  If passlib is updated to fix this issue, replace the `_hash_password_bcrypt` and
-  `_verify_password_bcrypt` internals with a CryptContext call — the public signatures
-  of `hash_password()` and `verify_password()` remain unchanged.
+  If passlib is updated to fix this issue, replace the internals with a CryptContext
+  call — the public signatures of `hash_password()` and `verify_password()` are
+  unchanged.
+
+Implementation note — bcrypt 72-byte limit:
+  bcrypt 5.x hard-rejects passwords whose UTF-8 encoding exceeds 72 bytes
+  (raising ValueError). Prior versions silently truncated, which was a different
+  problem. The spec mandates no maximum password length. The fix is SHA-256
+  pre-hashing: the password is first reduced to a fixed 32-byte digest before
+  bcrypt processing. This is the canonical solution used by Django's bcrypt
+  hasher. Full details in ``_prepare_password_bytes``.
 
 Milestone: M1-Step17 — Security utilities
 Status: COMPLETE
@@ -38,7 +46,7 @@ import os
 import re
 import secrets
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import bcrypt as _bcrypt
@@ -51,7 +59,6 @@ from pydantic import BaseModel, field_validator
 
 from apps.api.core.config import Settings, get_settings
 from apps.api.core.exceptions import UnauthorizedError
-
 
 # ---------------------------------------------------------------------------
 # Internal constants
@@ -73,6 +80,7 @@ _TOTP_KEY_INFO = b"financial-data-hub:totp-encryption-key:v1"
 # ---------------------------------------------------------------------------
 # TokenPayload — typed result of JWT verification
 # ---------------------------------------------------------------------------
+
 
 class TokenPayload(BaseModel):
     """
@@ -120,13 +128,44 @@ class TokenPayload(BaseModel):
     def _coerce_datetime(cls, v: object) -> datetime:
         """jose decodes exp/iat as int (Unix timestamp). Normalise to datetime."""
         if isinstance(v, datetime):
-            return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
-        return datetime.fromtimestamp(int(v), tz=timezone.utc)
+            return v if v.tzinfo else v.replace(tzinfo=UTC)
+        return datetime.fromtimestamp(int(v), tz=UTC)
 
 
 # ---------------------------------------------------------------------------
 # Password hashing  (Spec Part 2, Section 8.2, Decision 2)
 # ---------------------------------------------------------------------------
+
+
+def _prepare_password_bytes(plain_password: str) -> bytes:
+    """
+    Pre-hash a plaintext password with SHA-256 before bcrypt processing.
+
+    **Why this exists:**
+    bcrypt 5.x hard-rejects passwords whose UTF-8 encoding exceeds 72 bytes,
+    raising ``ValueError``. Prior bcrypt versions silently truncated, meaning
+    ``"A" * 73`` and ``"A" * 72 + "B"`` produced the *same* hash — a security
+    flaw. bcrypt 5.x fixed the truncation by rejecting long inputs entirely,
+    but that breaks the spec requirement of no maximum password length.
+
+    **The fix — SHA-256 prehash:**
+    Pre-hashing with SHA-256 produces a fixed 32-byte digest regardless of
+    the input length or Unicode content. 32 bytes is well within bcrypt's
+    72-byte limit. Critically, any two passwords that differ *anywhere*
+    produce different SHA-256 digests, so there is no truncation: two
+    passwords differing only at byte 73 will hash differently.
+
+    This is the canonical solution recommended by bcrypt's documentation and
+    used by Django's bcrypt hasher.
+
+    Args:
+        plain_password: The user-supplied plaintext password (any length).
+
+    Returns:
+        A 32-byte SHA-256 digest of the UTF-8-encoded password.
+    """
+    return hashlib.sha256(plain_password.encode("utf-8")).digest()
+
 
 def hash_password(plain_password: str) -> str:
     """
@@ -136,32 +175,32 @@ def hash_password(plain_password: str) -> str:
       "bcrypt with cost factor 12 via passlib[bcrypt].
        Never store plaintext or reversibly-encrypted passwords."
 
+    The password is first reduced to a 32-byte SHA-256 digest by
+    ``_prepare_password_bytes`` before bcrypt processing. This satisfies
+    the spec's no-maximum-length requirement for passwords of any length
+    and any Unicode content.
+
     Args:
-        plain_password: The user-supplied plaintext password.
+        plain_password: The user-supplied plaintext password (any length).
 
     Returns:
-        A bcrypt hash string (60 characters, $2b$12$…) safe to store in
-        the `users.password_hash` column.
-
-    Security note:
-        bcrypt internally truncates input at 72 bytes. This is a bcrypt
-        protocol limitation, not a bug. Passwords longer than 72 bytes are
-        accepted but only the first 72 bytes contribute to the hash. Per the
-        spec there is no maximum password length from a policy perspective —
-        the truncation is transparent to users and documented here for clarity.
+        A bcrypt hash string (60 characters, ``$2b$12$…``) safe to store
+        in the ``users.password_hash`` column.
     """
     salt = _bcrypt.gensalt(rounds=_BCRYPT_ROUNDS)
-    return _bcrypt.hashpw(plain_password.encode("utf-8"), salt).decode("utf-8")
+    return _bcrypt.hashpw(_prepare_password_bytes(plain_password), salt).decode("utf-8")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """
     Verify a plaintext password against a stored bcrypt hash.
 
-    Uses a constant-time comparison to prevent timing attacks.
+    The password is pre-hashed with SHA-256 (matching ``hash_password``)
+    before the bcrypt comparison. ``bcrypt.checkpw`` uses constant-time
+    comparison internally to prevent timing attacks.
 
     Args:
-        plain_password:   The user-supplied plaintext password.
+        plain_password:   The user-supplied plaintext password (any length).
         hashed_password:  The value stored in ``users.password_hash``.
 
     Returns:
@@ -170,7 +209,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     """
     try:
         return _bcrypt.checkpw(
-            plain_password.encode("utf-8"),
+            _prepare_password_bytes(plain_password),
             hashed_password.encode("utf-8"),
         )
     except Exception:  # noqa: BLE001 — invalid hash format, malformed input
@@ -180,6 +219,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 # ---------------------------------------------------------------------------
 # Password policy validation  (Spec Part 2, Section 8.3)
 # ---------------------------------------------------------------------------
+
 
 class PasswordPolicyError(ValueError):
     """
@@ -192,6 +232,7 @@ class PasswordPolicyError(ValueError):
       - Account lockout after 10 failed attempts; 30-minute unlock or admin reset
         (lockout is enforced by the auth router / repository, not here)
     """
+
     def __init__(self, violations: list[str]) -> None:
         self.violations = violations
         super().__init__("; ".join(violations))
@@ -255,7 +296,7 @@ async def check_hibp_password(password: str) -> bool:
         async with httpx.AsyncClient(timeout=3.0) as client:
             response = await client.get(
                 _HIBP_API_URL.format(prefix=prefix),
-                headers={"Add-Padding": "true"},   # Prevents traffic analysis
+                headers={"Add-Padding": "true"},  # Prevents traffic analysis
             )
             response.raise_for_status()
     except httpx.HTTPError:
@@ -274,6 +315,7 @@ async def check_hibp_password(password: str) -> bool:
 # ---------------------------------------------------------------------------
 # JWT access token  (Spec Part 2, Section 8.3)
 # ---------------------------------------------------------------------------
+
 
 def create_access_token(
     user_id: uuid.UUID,
@@ -306,7 +348,7 @@ def create_access_token(
             refresh token record to enable full session revocation.
     """
     cfg = settings or get_settings()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     jti = str(uuid.uuid4())
 
     payload: dict[str, object] = {
@@ -376,6 +418,7 @@ def verify_access_token(
 # Opaque refresh token  (Spec Part 2, Section 8.2, Decision 1)
 # ---------------------------------------------------------------------------
 
+
 def generate_raw_refresh_token() -> str:
     """
     Generate a cryptographically secure opaque refresh token.
@@ -420,12 +463,13 @@ def generate_refresh_token_expiry(*, settings: Settings | None = None) -> dateti
         UTC datetime 30 days from now.
     """
     cfg = settings or get_settings()
-    return datetime.now(timezone.utc) + timedelta(days=cfg.jwt_refresh_token_expire_days)
+    return datetime.now(UTC) + timedelta(days=cfg.jwt_refresh_token_expire_days)
 
 
 # ---------------------------------------------------------------------------
 # Password reset token
 # ---------------------------------------------------------------------------
+
 
 def generate_password_reset_token() -> str:
     """
@@ -441,7 +485,7 @@ def generate_password_reset_token() -> str:
         A 48-character URL-safe base64 string (288 bits of entropy).
         URL-safe encoding avoids percent-encoding issues in email links.
     """
-    raw = secrets.token_bytes(36)               # 288 bits
+    raw = secrets.token_bytes(36)  # 288 bits
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
@@ -464,6 +508,7 @@ def hash_password_reset_token(raw_token: str) -> str:
 # ---------------------------------------------------------------------------
 # TOTP / MFA utilities  (Spec Part 2, Section 8.2, Decision 4)
 # ---------------------------------------------------------------------------
+
 
 def generate_totp_secret() -> str:
     """
@@ -568,7 +613,7 @@ def encrypt_totp_secret(plain_secret: str, *, settings: Settings | None = None) 
     cfg = settings or get_settings()
     key = _derive_totp_key(cfg)
     aesgcm = AESGCM(key)
-    nonce = os.urandom(12)               # 96-bit nonce, unique per encryption
+    nonce = os.urandom(12)  # 96-bit nonce, unique per encryption
     ciphertext = aesgcm.encrypt(nonce, plain_secret.encode("utf-8"), b"")
     return base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
 
@@ -596,16 +641,16 @@ def decrypt_totp_secret(encrypted_secret: str, *, settings: Settings | None = No
 
     try:
         raw = base64.urlsafe_b64decode(encrypted_secret.encode("ascii"))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — base64 decode errors are not typed
         raise ValueError("TOTP secret is not valid base64url") from exc
 
-    if len(raw) < 13:   # minimum: 12-byte nonce + 1 byte ciphertext
+    if len(raw) < 13:  # minimum: 12-byte nonce + 1 byte ciphertext
         raise ValueError("TOTP secret payload is too short")
 
     nonce, ciphertext = raw[:12], raw[12:]
     try:
         plaintext = aesgcm.decrypt(nonce, ciphertext, b"")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — cryptography raises generic Exception on tag mismatch
         raise ValueError("TOTP secret decryption failed (authentication tag mismatch)") from exc
 
     return plaintext.decode("utf-8")

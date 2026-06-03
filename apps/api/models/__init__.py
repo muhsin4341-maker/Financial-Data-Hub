@@ -23,26 +23,26 @@ import enum
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
     Boolean,
     DateTime,
-    Enum as SAEnum,
     ForeignKey,
     Index,
     String,
-    Text,
     UniqueConstraint,
     Uuid,
     text,
+)
+from sqlalchemy import (
+    Enum as SAEnum,
 )
 from sqlalchemy.dialects.postgresql import INET, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from apps.api.core.database import Base
-
 
 # ---------------------------------------------------------------------------
 # UUID v7 generator
@@ -59,6 +59,7 @@ from apps.api.core.database import Base
 #   bits  61– 0 : rand_b (62 bits random)
 # ---------------------------------------------------------------------------
 
+
 def gen_uuid7() -> uuid.UUID:
     """
     Generate a time-ordered UUID v7.
@@ -66,18 +67,18 @@ def gen_uuid7() -> uuid.UUID:
     Produces monotonically increasing IDs that sort correctly in B-tree indexes
     while remaining globally unique. Safe for use as distributed primary keys.
     """
-    ms = int(time.time() * 1000)           # 48-bit millisecond timestamp
+    ms = int(time.time() * 1000)  # 48-bit millisecond timestamp
     rand = int.from_bytes(os.urandom(10), "big")  # 80 random bits
 
-    rand_a = (rand >> 68) & 0xFFF                  # 12 bits for rand_a field
-    rand_b = rand & 0x3FFF_FFFF_FFFF_FFFF          # 62 bits for rand_b field
+    rand_a = (rand >> 68) & 0xFFF  # 12 bits for rand_a field
+    rand_b = rand & 0x3FFF_FFFF_FFFF_FFFF  # 62 bits for rand_b field
 
     uuid_int = (
-        ((ms & 0xFFFF_FFFF_FFFF) << 80)   # bits 127–80: timestamp
-        | (0x7 << 76)                      # bits  79–76: version = 7
-        | (rand_a << 64)                   # bits  75–64: rand_a
-        | (0b10 << 62)                     # bits  63–62: variant = 10
-        | rand_b                           # bits  61– 0: rand_b
+        ((ms & 0xFFFF_FFFF_FFFF) << 80)  # bits 127–80: timestamp
+        | (0x7 << 76)  # bits  79–76: version = 7
+        | (rand_a << 64)  # bits  75–64: rand_a
+        | (0b10 << 62)  # bits  63–62: variant = 10
+        | rand_b  # bits  61– 0: rand_b
     )
     return uuid.UUID(int=uuid_int)
 
@@ -86,7 +87,8 @@ def gen_uuid7() -> uuid.UUID:
 # Enumerations
 # ---------------------------------------------------------------------------
 
-class UserRole(str, enum.Enum):
+
+class UserRole(enum.StrEnum):
     """
     Role-based access control roles.
 
@@ -95,7 +97,12 @@ class UserRole(str, enum.Enum):
       ADMIN   — Full data access, user management.
       ANALYST — Full data access, create and export jobs; cannot manage users.
       VIEWER  — Read-only; cannot create jobs or export.
+
+    ``enum.StrEnum`` (Python 3.11+) makes each member a ``str`` subclass,
+    so ``UserRole.ANALYST == "analyst"`` is True without an extra ``.value``
+    dereference. Replaces the legacy ``(str, enum.Enum)`` pattern.
     """
+
     OWNER = "owner"
     ADMIN = "admin"
     ANALYST = "analyst"
@@ -106,14 +113,16 @@ class UserRole(str, enum.Enum):
 # Helper: timezone-aware UTC now
 # ---------------------------------------------------------------------------
 
+
 def _utcnow() -> datetime:
     """Return current UTC datetime (timezone-aware)."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------
 # Model: Tenant
 # ---------------------------------------------------------------------------
+
 
 class Tenant(Base):
     """
@@ -206,6 +215,7 @@ class Tenant(Base):
 # ---------------------------------------------------------------------------
 # Model: User
 # ---------------------------------------------------------------------------
+
 
 class User(Base):
     """
@@ -349,6 +359,7 @@ class User(Base):
 # ---------------------------------------------------------------------------
 # Model: TenantMembership
 # ---------------------------------------------------------------------------
+
 
 class TenantMembership(Base):
     """
@@ -505,6 +516,7 @@ class TenantMembership(Base):
 # Model: RefreshToken
 # ---------------------------------------------------------------------------
 
+
 class RefreshToken(Base):
     """
     Server-side refresh token record.
@@ -636,7 +648,7 @@ class RefreshToken(Base):
         Call this before accepting a refresh token — do not issue new tokens
         for invalid entries.
         """
-        return self.revoked_at is None and datetime.now(timezone.utc) < self.expires_at
+        return self.revoked_at is None and datetime.now(UTC) < self.expires_at
 
     def __repr__(self) -> str:
         return (
@@ -648,6 +660,7 @@ class RefreshToken(Base):
 # ---------------------------------------------------------------------------
 # Model: AuditLog
 # ---------------------------------------------------------------------------
+
 
 class AuditLog(Base):
     """

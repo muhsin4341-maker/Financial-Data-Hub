@@ -18,11 +18,11 @@ Milestone: M1-Step17
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
+from apps.api.core.exceptions import UnauthorizedError
 from apps.api.core.security import (
     PasswordPolicyError,
     TokenPayload,
@@ -43,10 +43,9 @@ from apps.api.core.security import (
     verify_password,
     verify_totp_code,
 )
-from apps.api.core.exceptions import UnauthorizedError
-
 
 # ─── Fixtures ────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture()
 def mock_settings() -> MagicMock:
@@ -74,6 +73,7 @@ def sample_tenant_id() -> uuid.UUID:
 
 
 # ─── Password hashing ────────────────────────────────────────────────────────
+
 
 class TestPasswordHashing:
     """Spec Part 2, Section 8.2, Decision 2 — bcrypt cost factor 12."""
@@ -112,13 +112,93 @@ class TestPasswordHashing:
             assert isinstance(result, bool)
 
 
+# ─── Long-password regression tests ──────────────────────────────────────────
+
+
+class TestPasswordHashingLongPasswords:
+    """
+    Regression tests for the bcrypt 72-byte limit (P0 audit finding).
+
+    Root cause:
+        bcrypt 5.x hard-rejects passwords whose UTF-8 encoding exceeds 72
+        bytes, raising ValueError. The spec requires no maximum password
+        length.
+
+    Fix:
+        ``_prepare_password_bytes`` pre-hashes the password with SHA-256
+        to produce a fixed 32-byte digest before bcrypt processing. Two
+        passwords differing at any position produce different digests —
+        there is no truncation at any boundary.
+    """
+
+    def test_hash_password_73_ascii_chars(self) -> None:
+        """73 ASCII characters = 73 bytes — must not raise after the fix."""
+        long_password = "A" * 73 + "a1!"
+        result = hash_password(long_password)
+        assert result.startswith("$2b$12$")
+
+    def test_hash_password_200_chars(self) -> None:
+        """A 200-character passphrase must hash without error."""
+        passphrase = "correct horse battery staple " * 7  # 203 chars
+        result = hash_password(passphrase)
+        assert result.startswith("$2b$12$")
+
+    def test_verify_password_over_72_bytes(self) -> None:
+        """Round-trip verify must work correctly for passwords over 72 bytes."""
+        long_password = "B" * 80 + "b1!"
+        h = hash_password(long_password)
+        assert verify_password(long_password, h) is True
+        assert verify_password("B" * 80 + "b1?", h) is False  # one char different
+
+    def test_no_truncation_beyond_72_bytes(self) -> None:
+        """
+        Two passwords differing only at byte 73 must NOT match each other's hash.
+
+        Before the fix, bcrypt would silently truncate both passwords to 72
+        bytes so ``"A" * 73`` and ``"A" * 72 + "B"`` produced the *same* hash.
+        With SHA-256 pre-hashing, they produce different digests and therefore
+        different hashes.
+        """
+        pw_a = "A" * 73
+        pw_b = "A" * 72 + "B"  # differs only at position 73
+        h_a = hash_password(pw_a)
+        # pw_b must NOT verify against pw_a's hash
+        assert verify_password(pw_a, h_a) is True
+        assert verify_password(pw_b, h_a) is False
+
+    def test_hash_multibyte_unicode(self) -> None:
+        """
+        Multibyte Unicode password must hash and verify correctly.
+
+        'é' encodes to 2 bytes in UTF-8, so 40 × 'é' = 80 UTF-8 bytes.
+        Adding 'A1!' makes 83 bytes — well over bcrypt's 72-byte limit
+        without the prehash fix.
+        """
+        unicode_password = "é" * 40 + "A1!"  # 83 UTF-8 bytes
+        result = hash_password(unicode_password)
+        assert result.startswith("$2b$12$")
+        assert verify_password(unicode_password, result) is True
+
+    def test_hash_emoji_password(self) -> None:
+        """
+        Emoji characters (4 bytes each in UTF-8) must hash without error.
+
+        20 × '🔐' = 80 UTF-8 bytes; adding 'Aa1!' makes 84 bytes.
+        """
+        emoji_password = "🔐" * 20 + "Aa1!"  # 84 UTF-8 bytes
+        result = hash_password(emoji_password)
+        assert result.startswith("$2b$12$")
+        assert verify_password(emoji_password, result) is True
+
+
 # ─── Password policy ─────────────────────────────────────────────────────────
+
 
 class TestPasswordComplexity:
     """Spec Part 2, Section 8.3 — Password Policy."""
 
     def test_valid_password_passes(self) -> None:
-        validate_password_complexity("SecurePass1!")   # should not raise
+        validate_password_complexity("SecurePass1!")  # should not raise
 
     def test_too_short_raises(self) -> None:
         with pytest.raises(PasswordPolicyError) as exc_info:
@@ -154,13 +234,14 @@ class TestPasswordComplexity:
     def test_no_maximum_length(self) -> None:
         """Spec explicitly states no maximum password length."""
         long_password = "A" * 500 + "a1!"
-        validate_password_complexity(long_password)   # should not raise
+        validate_password_complexity(long_password)  # should not raise
 
     def test_exactly_12_chars_passes(self) -> None:
-        validate_password_complexity("Abcdefgh1!xy")   # exactly 12
+        validate_password_complexity("Abcdefgh1!xy")  # exactly 12
 
 
 # ─── HIBP check ───────────────────────────────────────────────────────────────
+
 
 class TestHIBPCheck:
     """
@@ -173,6 +254,7 @@ class TestHIBPCheck:
     async def test_pwned_password_returns_true(self) -> None:
         """If HIBP returns a matching suffix, must return True."""
         import hashlib
+
         password = "password123"
         sha1 = hashlib.sha1(password.encode(), usedforsecurity=False).hexdigest().upper()
         suffix = sha1[5:]
@@ -223,6 +305,7 @@ class TestHIBPCheck:
 
 # ─── JWT access token ─────────────────────────────────────────────────────────
 
+
 class TestJWTAccessToken:
     """Spec Part 2, Section 8.3 — JWT payload and token lifecycle."""
 
@@ -235,12 +318,13 @@ class TestJWTAccessToken:
         assert isinstance(token, str)
         assert len(token) > 0
         assert isinstance(jti, str)
-        assert len(jti) == 36   # UUID4 string length
+        assert len(jti) == 36  # UUID4 string length
 
     def test_token_contains_expected_claims(
         self, mock_settings: MagicMock, sample_user_id: uuid.UUID, sample_tenant_id: uuid.UUID
     ) -> None:
         from jose import jwt as jose_jwt
+
         token, jti = create_access_token(
             sample_user_id, sample_tenant_id, "owner", settings=mock_settings
         )
@@ -259,14 +343,15 @@ class TestJWTAccessToken:
         self, mock_settings: MagicMock, sample_user_id: uuid.UUID, sample_tenant_id: uuid.UUID
     ) -> None:
         from jose import jwt as jose_jwt
+
         token, _ = create_access_token(
             sample_user_id, sample_tenant_id, "analyst", settings=mock_settings
         )
         decoded = jose_jwt.decode(
             token, mock_settings.jwt_secret, algorithms=[mock_settings.jwt_algorithm]
         )
-        issued = datetime.fromtimestamp(decoded["iat"], tz=timezone.utc)
-        expiry = datetime.fromtimestamp(decoded["exp"], tz=timezone.utc)
+        issued = datetime.fromtimestamp(decoded["iat"], tz=UTC)
+        expiry = datetime.fromtimestamp(decoded["exp"], tz=UTC)
         delta = expiry - issued
         # Allow 2-second tolerance for execution time
         assert timedelta(minutes=14, seconds=58) <= delta <= timedelta(minutes=15, seconds=2)
@@ -289,13 +374,14 @@ class TestJWTAccessToken:
         self, mock_settings: MagicMock, sample_user_id: uuid.UUID, sample_tenant_id: uuid.UUID
     ) -> None:
         from jose import jwt as jose_jwt
+
         payload = {
             "sub": str(sample_user_id),
             "tid": str(sample_tenant_id),
             "role": "analyst",
             "jti": str(uuid.uuid4()),
-            "exp": datetime.now(timezone.utc) - timedelta(minutes=1),
-            "iat": datetime.now(timezone.utc) - timedelta(minutes=16),
+            "exp": datetime.now(UTC) - timedelta(minutes=1),
+            "iat": datetime.now(UTC) - timedelta(minutes=16),
             "type": "access",
         }
         expired_token = jose_jwt.encode(
@@ -326,14 +412,15 @@ class TestJWTAccessToken:
     ) -> None:
         """A token with type != 'access' must be rejected."""
         from jose import jwt as jose_jwt
+
         payload = {
             "sub": str(sample_user_id),
             "tid": str(sample_tenant_id),
             "role": "analyst",
             "jti": str(uuid.uuid4()),
-            "exp": datetime.now(timezone.utc) + timedelta(days=30),
-            "iat": datetime.now(timezone.utc),
-            "type": "refresh",   # <-- wrong type
+            "exp": datetime.now(UTC) + timedelta(days=30),
+            "iat": datetime.now(UTC),
+            "type": "refresh",  # <-- wrong type
         }
         wrong_type_token = jose_jwt.encode(
             payload, mock_settings.jwt_secret, algorithm=mock_settings.jwt_algorithm
@@ -354,6 +441,7 @@ class TestJWTAccessToken:
 
 
 # ─── Refresh token ───────────────────────────────────────────────────────────
+
 
 class TestRefreshToken:
     """Spec Part 2, Section 8.2, Decision 1 — opaque 256-bit refresh token."""
@@ -383,22 +471,25 @@ class TestRefreshToken:
         assert hash_refresh_token(r1) != hash_refresh_token(r2)
 
     def test_expiry_is_30_days(self, mock_settings: MagicMock) -> None:
-        before = datetime.now(timezone.utc)
+        before = datetime.now(UTC)
         expiry = generate_refresh_token_expiry(settings=mock_settings)
-        after = datetime.now(timezone.utc)
-        assert before + timedelta(days=29, hours=23) < expiry < after + timedelta(days=30, seconds=5)
+        after = datetime.now(UTC)
+        lower_bound = before + timedelta(days=29, hours=23)
+        upper_bound = after + timedelta(days=30, seconds=5)
+        assert lower_bound < expiry < upper_bound
 
 
 # ─── Password reset token ─────────────────────────────────────────────────────
 
-class TestPasswordResetToken:
 
+class TestPasswordResetToken:
     def test_token_is_url_safe_base64(self) -> None:
         token = generate_password_reset_token()
         import base64 as _b64
+
         # Should not raise
         decoded = _b64.urlsafe_b64decode(token + "==")
-        assert len(decoded) == 36   # 288 bits / 8
+        assert len(decoded) == 36  # 288 bits / 8
 
     def test_tokens_are_unique(self) -> None:
         tokens = [generate_password_reset_token() for _ in range(20)]
@@ -416,11 +507,11 @@ class TestPasswordResetToken:
 
 # ─── TOTP ─────────────────────────────────────────────────────────────────────
 
+
 class TestTOTP:
     """Spec Part 2, Section 8.2, Decision 4 — TOTP AES-256-GCM encryption."""
 
     def test_generate_secret_is_valid_base32(self) -> None:
-        import base64 as _b64
         secret = generate_totp_secret()
         assert isinstance(secret, str)
         assert len(secret) == 32
@@ -470,6 +561,7 @@ class TestTOTP:
 
     def test_verify_totp_correct_code(self, mock_settings: MagicMock) -> None:
         import pyotp as _pyotp
+
         secret = generate_totp_secret()
         encrypted = encrypt_totp_secret(secret, settings=mock_settings)
         code = _pyotp.TOTP(secret).now()
@@ -487,13 +579,12 @@ class TestTOTP:
 
 # ─── TokenPayload model ───────────────────────────────────────────────────────
 
+
 class TestTokenPayload:
     """Pydantic model validation for JWT payload parsing."""
 
-    def _valid_raw(
-        self, user_id: uuid.UUID, tenant_id: uuid.UUID
-    ) -> dict[str, object]:
-        now = datetime.now(timezone.utc)
+    def _valid_raw(self, user_id: uuid.UUID, tenant_id: uuid.UUID) -> dict[str, object]:
+        now = datetime.now(UTC)
         return {
             "sub": str(user_id),
             "tid": str(tenant_id),
@@ -507,9 +598,7 @@ class TestTokenPayload:
     def test_valid_payload_parses(
         self, sample_user_id: uuid.UUID, sample_tenant_id: uuid.UUID
     ) -> None:
-        payload = TokenPayload.model_validate(
-            self._valid_raw(sample_user_id, sample_tenant_id)
-        )
+        payload = TokenPayload.model_validate(self._valid_raw(sample_user_id, sample_tenant_id))
         assert payload.sub == sample_user_id
         assert payload.tid == sample_tenant_id
         assert payload.type == "access"
@@ -517,9 +606,7 @@ class TestTokenPayload:
     def test_exp_coerced_to_datetime(
         self, sample_user_id: uuid.UUID, sample_tenant_id: uuid.UUID
     ) -> None:
-        payload = TokenPayload.model_validate(
-            self._valid_raw(sample_user_id, sample_tenant_id)
-        )
+        payload = TokenPayload.model_validate(self._valid_raw(sample_user_id, sample_tenant_id))
         assert isinstance(payload.exp, datetime)
         assert payload.exp.tzinfo is not None
 
@@ -527,6 +614,7 @@ class TestTokenPayload:
         self, sample_user_id: uuid.UUID, sample_tenant_id: uuid.UUID
     ) -> None:
         from pydantic import ValidationError
+
         raw = self._valid_raw(sample_user_id, sample_tenant_id)
         raw["type"] = "refresh"
         with pytest.raises(ValidationError):
