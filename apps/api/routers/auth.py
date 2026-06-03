@@ -10,21 +10,23 @@ Endpoints implemented:
   POST /api/v1/auth/register  — M1-Step18 ✓
   POST /api/v1/auth/login     — M1-Step19 ✓
   POST /api/v1/auth/refresh   — M1-Step20 ✓
+  POST /api/v1/auth/logout    — M1-Step21 ✓
 
 Endpoints planned (future steps):
-  POST /api/v1/auth/logout          — M1-Step21
   POST /api/v1/auth/forgot-password — M1-Step22
   POST /api/v1/auth/reset-password  — M1-Step23
 
 Milestone: M1-Step18 — POST /auth/register  ✓
            M1-Step19 — POST /auth/login      ✓
            M1-Step20 — POST /auth/refresh    ✓
+           M1-Step21 — POST /auth/logout     ✓
 Status:    COMPLETE
 """
 
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Cookie, Depends, Request, Response
@@ -43,6 +45,7 @@ from apps.api.core.security import (
     hash_refresh_token,
     verify_password,
 )
+from apps.api.middleware.auth import AuthRequestContext, require_authenticated
 from apps.api.models import UserRole
 from apps.api.repositories.auth import AuthRepository
 from apps.api.schemas.auth import AuthResponse, LoginRequest, RegisterRequest
@@ -560,4 +563,105 @@ async def refresh(
         user_id=user.id,
         tenant_id=membership.tenant_id,
         role=str(membership.role),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/auth/logout
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/logout",
+    status_code=204,
+    summary="Log out and revoke session tokens",
+    description=(
+        "Revokes the server-side refresh token associated with the current "
+        "access token (matched by jti), blocklists the access token jti in "
+        "Redis for its remaining lifetime, and clears the ``fdh_refresh`` "
+        "httpOnly cookie. Requires a valid Bearer token."
+    ),
+)
+async def logout(
+    request: Request,
+    response: Response,
+    ctx: AuthRequestContext = Depends(require_authenticated),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """
+    Logout flow:
+
+    1. Validate Bearer token (enforced by ``require_authenticated``).
+    2. Compute remaining access token TTL for the Redis blocklist key.
+    3. Look up the RefreshToken record by ``ctx.jti``.
+       - Revoke it (set ``revoked_at``) if found and not already revoked.
+       - Proceed idempotently if already revoked or not found.
+    4. Blocklist ``ctx.jti`` in Redis with TTL = remaining access token life.
+       Fail-open: a Redis outage must not prevent logout from completing.
+    5. Write AuditLog entry (action="user.logout").
+    6. Clear the ``fdh_refresh`` cookie.
+    7. Return HTTP 204 No Content.
+
+    Idempotency: calling logout twice with the same (still-valid) access
+    token succeeds both times. The second call finds the refresh token
+    already revoked and proceeds without error.
+
+    Security note: the Redis blocklist entry means the access token is
+    rejected by JWTAuthMiddleware from this point forward, even before
+    its natural 15-minute expiry. The DB ``revoked_at`` flag on the
+    RefreshToken provides a durable, Redis-independent revocation record.
+    """
+    repo = AuthRepository(db)
+
+    # ── Step 2: Compute remaining access token TTL ────────────────────────────
+    remaining_ttl = max(
+        0,
+        int((ctx.payload.exp - datetime.now(UTC)).total_seconds()),
+    )
+
+    # ── Step 3: Revoke the paired refresh token (by jti) ─────────────────────
+    stored_token = await repo.get_refresh_token_by_jti(ctx.jti)
+    if stored_token is not None and stored_token.revoked_at is None:
+        await repo.revoke_refresh_token(stored_token)
+        log.debug("auth.logout.refresh_token_revoked", jti=ctx.jti)
+    else:
+        # Already revoked or not found — idempotent, proceed normally.
+        log.debug(
+            "auth.logout.refresh_token_skipped",
+            jti=ctx.jti,
+            found=stored_token is not None,
+        )
+
+    # ── Step 4: Blocklist access token jti in Redis ───────────────────────────
+    try:
+        await _blocklist_jti(jti=ctx.jti, ttl_seconds=remaining_ttl)
+    except Exception:  # noqa: BLE001
+        log.warning("auth.logout.blocklist_error", jti=ctx.jti)
+
+    # ── Step 5: Audit log ─────────────────────────────────────────────────────
+    await repo.create_audit_log(
+        tenant_id=ctx.tenant_id,
+        user_id=ctx.user_id,
+        action="user.logout",
+        entity_type="user",
+        entity_id=ctx.user_id,
+        ip_address=_client_ip(request),
+        user_agent=_client_ua(request),
+        request_id=_request_id(request),
+    )
+
+    # ── Step 6: Clear refresh cookie ──────────────────────────────────────────
+    response.delete_cookie(
+        key=_REFRESH_COOKIE,
+        path=_REFRESH_COOKIE_PATH,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+    )
+
+    log.info(
+        "auth.logout.success",
+        user_id=str(ctx.user_id),
+        tenant_id=str(ctx.tenant_id),
+        jti=ctx.jti,
     )

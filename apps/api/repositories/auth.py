@@ -18,6 +18,7 @@ Repository contract:
 Milestone: M1-Step18 — POST /auth/register  ✓
            M1-Step19 — POST /auth/login      ✓
            M1-Step20 — POST /auth/refresh    ✓
+           M1-Step21 — POST /auth/logout     ✓
 Status:    COMPLETE
 """
 
@@ -144,6 +145,29 @@ class AuthRepository:
         """
         result = await self._session.execute(
             select(RefreshToken).where(RefreshToken.token_hash == token_hash)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_refresh_token_by_jti(self, jti: str) -> RefreshToken | None:
+        """
+        Look up a refresh token record by its paired JWT ID (jti).
+
+        ``RefreshToken.jti`` stores the same jti value that was embedded in
+        the paired access token at issuance. This allows the logout endpoint to
+        find and revoke the server-side token using only the claim from the
+        Bearer token — without requiring the raw cookie value.
+
+        The unique index on ``refresh_tokens.jti`` makes this a single-row
+        lookup with O(log n) cost.
+
+        Args:
+            jti: JWT ID string from the authenticated access token payload.
+
+        Returns:
+            ``RefreshToken`` ORM instance if found, ``None`` otherwise.
+        """
+        result = await self._session.execute(
+            select(RefreshToken).where(RefreshToken.jti == jti)
         )
         return result.scalar_one_or_none()
 
