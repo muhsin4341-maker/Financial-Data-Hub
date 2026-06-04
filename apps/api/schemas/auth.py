@@ -4,10 +4,11 @@ Auth request/response Pydantic schemas.
 Engineering Specification references:
   Part 2, Section 8.2  — Password policy: 12 chars, uppercase, lowercase, digit, special char
   Part 2, Section 8.3  — JWT response payload: access_token, token_type, user_id, tenant_id, role
-  Part 3, Section 11.3 — POST /auth/register and POST /auth/login request bodies
+  Part 3, Section 11.3 — POST /auth/* request bodies
 
-Milestone: M1-Step18 — POST /auth/register  ✓
-           M1-Step19 — POST /auth/login      ✓
+Milestone: M1-Step18 — POST /auth/register        ✓
+           M1-Step19 — POST /auth/login            ✓
+           M1-Step22 — POST /auth/forgot-password  ✓
 Status:    COMPLETE
 """
 
@@ -89,6 +90,34 @@ class LoginRequest(BaseModel):
     def _normalise_email(cls, v: str) -> str:
         """Lowercase for consistent lookup against the stored email."""
         return v.lower()
+
+
+class ForgotPasswordRequest(BaseModel):
+    """
+    Request body for POST /auth/forgot-password.
+
+    Only the email address is needed — no authentication is required because
+    the user has lost access to their account. The email is normalised to
+    lowercase before lookup.
+    """
+
+    email: EmailStr = Field(description="Email address associated with the account.")
+
+    @field_validator("email")
+    @classmethod
+    def _normalise_email(cls, v: str) -> str:
+        return v.lower()
+
+
+class MessageResponse(BaseModel):
+    """
+    Generic single-message response for operations with no domain payload.
+
+    Used by forgot-password and similar endpoints where the response must
+    be identical regardless of internal outcome (to prevent enumeration).
+    """
+
+    message: str = Field(description="Human-readable status message.")
 
 
 class AuthResponse(BaseModel):

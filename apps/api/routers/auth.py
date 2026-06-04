@@ -7,26 +7,27 @@ Engineering Specification references:
   Part 3, Section 11.3 — API endpoint definitions
 
 Endpoints implemented:
-  POST /api/v1/auth/register  — M1-Step18 ✓
-  POST /api/v1/auth/login     — M1-Step19 ✓
-  POST /api/v1/auth/refresh   — M1-Step20 ✓
-  POST /api/v1/auth/logout    — M1-Step21 ✓
+  POST /api/v1/auth/register         — M1-Step18 ✓
+  POST /api/v1/auth/login            — M1-Step19 ✓
+  POST /api/v1/auth/refresh          — M1-Step20 ✓
+  POST /api/v1/auth/logout           — M1-Step21 ✓
+  POST /api/v1/auth/forgot-password  — M1-Step22 ✓
 
 Endpoints planned (future steps):
-  POST /api/v1/auth/forgot-password — M1-Step22
-  POST /api/v1/auth/reset-password  — M1-Step23
+  POST /api/v1/auth/reset-password   — M1-Step23
 
-Milestone: M1-Step18 — POST /auth/register  ✓
-           M1-Step19 — POST /auth/login      ✓
-           M1-Step20 — POST /auth/refresh    ✓
-           M1-Step21 — POST /auth/logout     ✓
+Milestone: M1-Step18 — POST /auth/register        ✓
+           M1-Step19 — POST /auth/login            ✓
+           M1-Step20 — POST /auth/refresh          ✓
+           M1-Step21 — POST /auth/logout           ✓
+           M1-Step22 — POST /auth/forgot-password  ✓
 Status:    COMPLETE
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from fastapi import APIRouter, Cookie, Depends, Request, Response
@@ -35,20 +36,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.core.config import get_settings
 from apps.api.core.database import get_db
+from apps.api.core.email import EmailMessage, get_email_backend, render_email_template
 from apps.api.core.exceptions import ConflictError, UnauthorizedError, ValidationError
 from apps.api.core.security import (
     check_hibp_password,
     create_access_token,
+    generate_password_reset_token,
     generate_raw_refresh_token,
     generate_refresh_token_expiry,
     hash_password,
+    hash_password_reset_token,
     hash_refresh_token,
     verify_password,
 )
 from apps.api.middleware.auth import AuthRequestContext, require_authenticated
 from apps.api.models import UserRole
 from apps.api.repositories.auth import AuthRepository
-from apps.api.schemas.auth import AuthResponse, LoginRequest, RegisterRequest
+from apps.api.schemas.auth import (
+    AuthResponse,
+    ForgotPasswordRequest,
+    LoginRequest,
+    MessageResponse,
+    RegisterRequest,
+)
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
@@ -665,3 +675,159 @@ async def logout(
         tenant_id=str(ctx.tenant_id),
         jti=ctx.jti,
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/auth/forgot-password
+# ---------------------------------------------------------------------------
+
+#: The response is identical for existing and non-existing emails.
+#: Never tell the caller whether the account exists.
+_FORGOT_PASSWORD_RESPONSE = (
+    "If an account with that email address exists, "
+    "a password reset link has been sent."
+)
+
+#: Reset token validity window (1 hour per Spec, mirrored from Settings).
+_RESET_TOKEN_EXPIRE_HOURS = 1
+
+
+@router.post(
+    "/forgot-password",
+    response_model=MessageResponse,
+    status_code=200,
+    summary="Request a password reset link",
+    description=(
+        "Generates a secure one-time reset token and dispatches a password "
+        "reset email when a matching active account is found. Always returns "
+        "the same response regardless of whether the email exists, to prevent "
+        "account enumeration."
+    ),
+)
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> MessageResponse:
+    """
+    Forgot-password flow:
+
+    1. Look up user by email (silently — no 404 on unknown email).
+    2. If user found and active:
+       a. Generate a cryptographically secure raw reset token (288 bits).
+       b. Hash it with SHA-256 and persist alongside an expiry timestamp
+          (default 1 hour from now) on the User record.
+       c. Render password_reset.txt / password_reset.html Jinja2 templates.
+       d. Dispatch the email via the configured EmailBackend.
+          In development: ConsoleEmailBackend (logs to stdout, no network).
+          In production: SESEmailBackend / ResendEmailBackend (M8).
+          NOTE: M8 will replace the direct backend call with a Celery task
+          dispatch for async delivery and retry logic.
+       e. Write AuditLog entry (action="user.password_reset_requested").
+    3. Always return the same 200 MessageResponse to prevent enumeration.
+
+    Security: the endpoint never reveals whether a given email is registered.
+    The response body, status code, and latency are designed to be
+    indistinguishable between existing and non-existing accounts.
+    """
+    repo = AuthRepository(db)
+    settings = get_settings()
+
+    # ── Step 1: Look up user (silently) ──────────────────────────────────────
+    user = await repo.get_user_by_email(payload.email)
+
+    if user is not None and user.is_active:
+        # ── Step 2a: Generate reset token ─────────────────────────────────────
+        raw_token = generate_password_reset_token()
+        token_hash = hash_password_reset_token(raw_token)
+        expires_at = datetime.now(UTC) + timedelta(
+            hours=settings.password_reset_token_expire_hours
+        )
+
+        # ── Step 2b: Persist token hash ───────────────────────────────────────
+        await repo.update_password_reset_token(
+            user=user,
+            token_hash=token_hash,
+            expires_at=expires_at,
+        )
+
+        # ── Step 2c: Build reset link and render templates ────────────────────
+        reset_link = (
+            f"{settings.frontend_base_url}/auth/reset-password"
+            f"?token={raw_token}"
+        )
+        expires_in = f"{settings.password_reset_token_expire_hours} hour"
+        if settings.password_reset_token_expire_hours != 1:
+            expires_in += "s"
+
+        template_ctx = {
+            "full_name": user.full_name,
+            "email": user.email,
+            "reset_link": reset_link,
+            "expires_in": expires_in,
+        }
+
+        try:
+            text_body = render_email_template("password_reset.txt", template_ctx)
+            html_body = render_email_template("password_reset.html", template_ctx)
+        except Exception:  # noqa: BLE001 — template error must not block the response
+            log.error("auth.forgot_password.template_render_failed", user_id=str(user.id))
+            text_body = (
+                f"Reset your password: {reset_link}\n"
+                f"This link expires in {expires_in}."
+            )
+            html_body = ""
+
+        # ── Step 2d: Dispatch email ───────────────────────────────────────────
+        # M1: direct call to the configured backend (ConsoleEmailBackend in dev).
+        # M8: replace with celery_app.send_task("workers.tasks.notification_tasks
+        #                                        .send_password_reset_email", ...)
+        from_address = (
+            f"{settings.email_from_name} <{settings.email_from_address}>"
+            if settings.email_from_name
+            else settings.email_from_address
+        )
+        email_backend = get_email_backend(settings)
+        try:
+            await email_backend.send(
+                EmailMessage(
+                    to=user.email,
+                    subject="Reset your Financial Data Hub password",
+                    text_body=text_body,
+                    html_body=html_body,
+                    from_address=from_address,
+                    from_name=settings.email_from_name,
+                )
+            )
+        except Exception:  # noqa: BLE001 — email failure must not block the response
+            log.error(
+                "auth.forgot_password.email_send_failed",
+                user_id=str(user.id),
+                backend=settings.email_backend,
+            )
+
+        # ── Step 2e: Audit log ────────────────────────────────────────────────
+        await repo.create_audit_log(
+            tenant_id=user.memberships[0].tenant_id
+            if user.memberships
+            else uuid.UUID(int=0),  # fallback for data integrity edge case
+            user_id=user.id,
+            action="user.password_reset_requested",
+            entity_type="user",
+            entity_id=user.id,
+            ip_address=_client_ip(request),
+            user_agent=_client_ua(request),
+            request_id=_request_id(request),
+        )
+
+        log.info("auth.forgot_password.token_issued", user_id=str(user.id))
+
+    else:
+        # Unknown email or deactivated account — log at debug, never reveal.
+        log.debug(
+            "auth.forgot_password.user_not_found_or_inactive",
+            email=payload.email,
+        )
+
+    # ── Step 3: Always return the same response ───────────────────────────────
+    return MessageResponse(message=_FORGOT_PASSWORD_RESPONSE)

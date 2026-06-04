@@ -15,10 +15,11 @@ Repository contract:
   - The session is never committed here; the caller (route handler + get_db
     dependency) owns the transaction boundary.
 
-Milestone: M1-Step18 — POST /auth/register  ✓
-           M1-Step19 — POST /auth/login      ✓
-           M1-Step20 — POST /auth/refresh    ✓
-           M1-Step21 — POST /auth/logout     ✓
+Milestone: M1-Step18 — POST /auth/register        ✓
+           M1-Step19 — POST /auth/login            ✓
+           M1-Step20 — POST /auth/refresh          ✓
+           M1-Step21 — POST /auth/logout           ✓
+           M1-Step22 — POST /auth/forgot-password  ✓
 Status:    COMPLETE
 """
 
@@ -215,6 +216,36 @@ class AuthRepository:
             .limit(1)
         )
         return result.scalar_one_or_none()
+
+    async def update_password_reset_token(
+        self,
+        user: User,
+        token_hash: str,
+        expires_at: datetime,
+    ) -> None:
+        """
+        Persist a hashed password reset token and its expiry on the User record.
+
+        The raw token NEVER reaches this layer — the caller hashes it with
+        ``hash_password_reset_token()`` before passing it here.
+
+        Overwrites any previous reset token on the same user (at most one
+        outstanding reset token per account at a time). This prevents
+        accumulated tokens from creating a wider attack surface.
+
+        Args:
+            user:       The User whose reset token is being set.
+            token_hash: SHA-256 hex digest of the raw URL-safe token.
+            expires_at: Absolute UTC expiry (typically now + 1 hour).
+        """
+        user.password_reset_token = token_hash
+        user.password_reset_expires_at = expires_at
+        await self._session.flush([user])
+        log.debug(
+            "auth.repository.password_reset_token_set",
+            user_id=str(user.id),
+            expires_at=expires_at.isoformat(),
+        )
 
     async def update_last_login(self, user: User) -> None:
         """

@@ -93,6 +93,10 @@ class Settings(BaseSettings):
     sentry_dsn: str = ""
     prometheus_metrics_port: int = 9090
 
+    # Frontend
+    frontend_base_url: str = "http://localhost:3000"
+    password_reset_token_expire_hours: int = 1
+
     # CORS — stored as comma-separated string; use .cors_origins property for list
     allowed_origins: str = "http://localhost:3000"
 
