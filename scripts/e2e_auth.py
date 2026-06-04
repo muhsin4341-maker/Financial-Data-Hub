@@ -32,8 +32,8 @@ async def main() -> None:
     import httpx
     from httpx import ASGITransport
 
-    # Import app after dotenv is loaded so get_settings() picks up DATABASE_URL.
-    from apps.api.main import app
+    # Import app and lifespan after dotenv is loaded.
+    from apps.api.main import app, lifespan
 
     suffix = uuid.uuid4().hex[:8]
     email = f"e2e-{suffix}@example.com"
@@ -51,7 +51,7 @@ async def main() -> None:
             failed.append(name)
             print(f"  ✗ {name}{f': {detail}' if detail else ''}")
 
-    async with httpx.AsyncClient(
+    async with lifespan(app), httpx.AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
 

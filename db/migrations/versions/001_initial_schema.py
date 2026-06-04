@@ -50,13 +50,6 @@ def upgrade() -> None:
     op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
     op.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
 
-    # ── Enum: user_role ───────────────────────────────────────────────────────
-    user_role_enum = sa.Enum(
-        "owner", "admin", "analyst", "viewer",
-        name="user_role",
-    )
-    user_role_enum.create(op.get_bind(), checkfirst=True)
-
     # ── Table: tenants ────────────────────────────────────────────────────────
     op.create_table(
         "tenants",
@@ -164,7 +157,6 @@ def upgrade() -> None:
             sa.Enum(
                 "owner", "admin", "analyst", "viewer",
                 name="user_role",
-                create_constraint=True,
             ),
             nullable=False,
         ),

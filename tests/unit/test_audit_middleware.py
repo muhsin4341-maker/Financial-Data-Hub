@@ -458,10 +458,18 @@ class TestAuditRecordAuthenticated:
 
 class TestAuditRecordAnonymous:
     @pytest.mark.anyio
-    async def test_anonymous_request_audited_with_null_tenant_user(
+    async def test_anonymous_request_not_written_to_db(
         self, mock_settings: MagicMock
     ) -> None:
-        """An unauthenticated request must be audited with tenant_id=None and user_id=None."""
+        """
+        An unauthenticated request must NOT write to audit_log.
+
+        audit_log.tenant_id is NOT NULL; anonymous requests have no JWT
+        context so tenant_id would be None — violating the constraint.
+        Public auth endpoints write their own business-level audit records
+        via repo.create_audit_log() with the correct tenant_id.
+        This test verifies the middleware skips the DB write in that case.
+        """
         factory, session = _mock_session_factory()
         app = _build_app(mock_settings)
 
@@ -469,14 +477,13 @@ class TestAuditRecordAnonymous:
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
             ) as client:
-                # No auth header
+                # No auth header — anonymous request
                 await client.get("/api/v1/resource")
                 await asyncio.sleep(0)
 
-        session.add.assert_called_once()
-        record: AuditLog = session.add.call_args[0][0]
-        assert record.tenant_id is None
-        assert record.user_id is None
+        # Middleware-level audit write is skipped for anonymous requests
+        # (tenant_id would be None, violating the NOT NULL constraint).
+        session.add.assert_not_called()
 
     @pytest.mark.anyio
     async def test_anonymous_request_still_gets_request_id_header(

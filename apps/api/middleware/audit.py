@@ -155,6 +155,19 @@ async def _write_audit_record(
         )
         return
 
+    # Skip middleware-level audit write for unauthenticated requests.
+    # audit_log.tenant_id is NOT NULL; public auth endpoints (register,
+    # login, forgot-password, reset-password) have no JWT context here.
+    # Those endpoints write their own business-level audit records via
+    # repo.create_audit_log() with the correct tenant_id.
+    if tenant_id is None:
+        logger.debug(
+            "audit.skipped_no_tenant",
+            action=action,
+            request_id=str(request_id) if request_id else None,
+        )
+        return
+
     try:
         async with AsyncSessionFactory() as session:
             record = AuditLog(

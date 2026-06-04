@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("DATABASE_URL"),
@@ -32,12 +32,6 @@ pytestmark = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
-async def client() -> AsyncClient:  # type: ignore[override]
-    from apps.api.main import app
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        yield c  # type: ignore[misc]
 
 
 @pytest.fixture()

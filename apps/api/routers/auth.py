@@ -807,10 +807,12 @@ async def forgot_password(
             )
 
         # ── Step 2e: Audit log ────────────────────────────────────────────────
+        # Use get_active_membership() rather than user.memberships to avoid
+        # triggering lazy loading in an async SQLAlchemy session (MissingGreenlet).
+        fp_membership = await repo.get_active_membership(user.id)
+        fp_tenant_id = fp_membership.tenant_id if fp_membership else uuid.UUID(int=0)
         await repo.create_audit_log(
-            tenant_id=user.memberships[0].tenant_id
-            if user.memberships
-            else uuid.UUID(int=0),  # fallback for data integrity edge case
+            tenant_id=fp_tenant_id,
             user_id=user.id,
             action="user.password_reset_requested",
             entity_type="user",

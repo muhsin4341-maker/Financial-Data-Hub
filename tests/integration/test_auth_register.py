@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 
 
 # ---------------------------------------------------------------------------
@@ -42,18 +42,6 @@ pytestmark = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
-async def client() -> AsyncClient:  # type: ignore[override]
-    """
-    HTTP client targeting the real FastAPI application with the real DB.
-
-    Imports ``app`` here (not at module level) so the skip marker fires
-    before any import-time DB initialisation occurs.
-    """
-    from apps.api.main import app
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        yield c  # type: ignore[misc]
 
 
 @pytest.fixture()

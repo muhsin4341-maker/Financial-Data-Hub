@@ -30,7 +30,7 @@ if not os.getenv("DATABASE_URL"):
 async def main() -> None:
     import httpx
     from httpx import ASGITransport
-    from apps.api.main import app
+    from apps.api.main import app, lifespan
 
     suffix = uuid.uuid4().hex[:8]
     email = f"e2e-reset-{suffix}@example.com"
@@ -52,7 +52,7 @@ async def main() -> None:
             failed.append(name)
             print(f"  ✗ {name}{f': {detail}' if detail else ''}")
 
-    async with httpx.AsyncClient(
+    async with lifespan(app), httpx.AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
 
