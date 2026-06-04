@@ -1,5 +1,5 @@
 """
-ORM Models — Foundation Layer.
+ORM Models.
 
 Engineering Specification references:
   Part 1, Section 1.2, Decision 1  — UUID v7 primary keys (time-ordered)
@@ -12,9 +12,11 @@ Engineering Specification references:
   Part 2, Section 8.2, Decision 4  — TOTP secret AES-encrypted in users table
   Part 2, Section 8.3              — JWT payload: sub, tid, role, exp, jti
   Part 2, Section 8.3              — Refresh token: 30-day expiry, rotation, Redis blocklist
+  M2 Execution Plan, Section 5     — companies and financial_jobs tables
 
-Milestone: M1-Step 13 (ORM models)
-Status: COMPLETE
+Milestones:
+  M1-Step 13 — Foundation models (Tenant, User, TenantMembership, RefreshToken, AuditLog)
+  M2-Step 2  — Domain models (Company, FinancialJob)
 """
 
 from __future__ import annotations
@@ -31,7 +33,9 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
+    Text,
     UniqueConstraint,
     Uuid,
     text,
@@ -107,6 +111,31 @@ class UserRole(enum.StrEnum):
     ADMIN = "admin"
     ANALYST = "analyst"
     VIEWER = "viewer"
+
+
+class JobStatus(enum.StrEnum):
+    """
+    Lifecycle states for a FinancialJob.
+
+    M2 Execution Plan, Section 2.3.3 — Job Status Transitions:
+      PENDING   → QUEUED     Celery task accepted by broker.
+      QUEUED    → RUNNING    Worker picks up the task.
+      RUNNING   → COMPLETED  Extraction + export finished successfully.
+      RUNNING   → FAILED     Unhandled exception in worker.
+      PENDING/QUEUED/RUNNING → CANCELLED  API cancel request received.
+
+    Stored as VARCHAR(50) (not a DB-level ENUM) so future statuses can be
+    added without an ALTER TYPE migration.  Application code uses this enum
+    for type-safe comparisons; the column default is the string literal
+    'pending'.
+    """
+
+    PENDING = "pending"
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +234,12 @@ class Tenant(Base):
     audit_logs: Mapped[list[AuditLog]] = relationship(
         "AuditLog",
         back_populates="tenant",
+        lazy="select",
+    )
+    companies: Mapped[list[Company]] = relationship(  # M2
+        "Company",
+        back_populates="tenant",
+        cascade="all, delete-orphan",
         lazy="select",
     )
 
@@ -814,15 +849,427 @@ class AuditLog(Base):
 
 
 # ---------------------------------------------------------------------------
+# Model: Company  (M2-Step 2)
+# ---------------------------------------------------------------------------
+
+
+class Company(Base):
+    """
+    A company being tracked within a tenant workspace.
+
+    Each tenant maintains its own list of companies to analyse.  The same
+    real-world company (same ticker / CIK) can exist as separate rows in
+    different tenants — no global deduplication at this layer.
+
+    Ticker uniqueness is scoped to (tenant_id, ticker) rather than globally
+    unique.  This prevents false conflicts when two tenants independently add
+    the same company, and avoids a migration amendment if a ticker is ever
+    re-listed on a different exchange.  See M2 Execution Plan Risk R-08.
+
+    Retention: Indefinite within the tenant workspace.
+    Engineering Spec Part 1, Section 1.2, Decision 3 — tenant_id isolation.
+    Engineering Spec Part 1, Section 1.2, Decision 4 — soft delete.
+    """
+
+    __tablename__ = "companies"
+
+    # ── Primary key ──────────────────────────────────────────────────────────
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=gen_uuid7,
+        doc="UUID v7 primary key — time-ordered for B-tree performance.",
+    )
+
+    # ── Tenancy ───────────────────────────────────────────────────────────────
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        doc="Owning tenant.  All company data is isolated per tenant.",
+    )
+
+    # ── Identity ─────────────────────────────────────────────────────────────
+    name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        doc="Full legal or trading name of the company.",
+    )
+    ticker: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        doc=(
+            "Stock ticker symbol (e.g. 'AAPL').  Unique within the tenant "
+            "workspace — see uq_companies_tenant_ticker constraint."
+        ),
+    )
+    cik: Mapped[str | None] = mapped_column(
+        String(10),
+        nullable=True,
+        default=None,
+        doc=(
+            "SEC Central Index Key — 10-digit zero-padded identifier used to "
+            "query SEC EDGAR.  NULL until resolved by the acquisition service."
+        ),
+    )
+
+    # ── Classification ────────────────────────────────────────────────────────
+    exchange: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+        default=None,
+        doc="Primary listing exchange (e.g. 'NYSE', 'NASDAQ', 'OTC').",
+    )
+    sector: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        default=None,
+        doc="GICS sector classification.",
+    )
+    industry: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        default=None,
+        doc="GICS industry classification.",
+    )
+
+    # ── Profile ───────────────────────────────────────────────────────────────
+    description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        default=None,
+        doc="Free-text company description.",
+    )
+    website: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        default=None,
+        doc="Corporate website URL.",
+    )
+
+    # ── Status ────────────────────────────────────────────────────────────────
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("true"),
+        doc=(
+            "False = company is hidden from normal queries but retained for "
+            "historical job records.  Not the same as soft delete."
+        ),
+    )
+
+    # ── Timestamps ───────────────────────────────────────────────────────────
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=text("NOW()"),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=text("NOW()"),
+        onupdate=_utcnow,
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+        doc=(
+            "Soft delete timestamp.  NULL = active.  Soft-deleted companies are "
+            "excluded from normal list queries but their job records are retained."
+        ),
+    )
+
+    # ── Table-level constraints and indexes ───────────────────────────────────
+    __table_args__ = (
+        # One ticker per tenant workspace (not globally unique — Risk R-08).
+        UniqueConstraint(
+            "tenant_id",
+            "ticker",
+            name="uq_companies_tenant_ticker",
+        ),
+        # Unique CIK within a tenant when provided.
+        UniqueConstraint(
+            "tenant_id",
+            "cik",
+            name="uq_companies_tenant_cik",
+            # Only enforce when cik IS NOT NULL; NULL values are excluded from
+            # UNIQUE constraints in PostgreSQL, so this is naturally handled.
+        ),
+        # Primary tenant lookup — list all companies for a workspace.
+        Index("ix_companies_tenant_id", "tenant_id"),
+        # Fast active-record filter (most common query excludes soft-deleted rows).
+        Index(
+            "ix_companies_tenant_id_active",
+            "tenant_id",
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+        # GIN trigram index — powers ILIKE fuzzy name search (pg_trgm extension).
+        # Extension is already present from migration 001 (CREATE EXTENSION pg_trgm).
+        Index(
+            "gin_companies_name",
+            "name",
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+        ),
+    )
+
+    # ── Relationships ─────────────────────────────────────────────────────────
+    tenant: Mapped[Tenant] = relationship(
+        "Tenant",
+        back_populates="companies",
+        lazy="select",
+    )
+    jobs: Mapped[list[FinancialJob]] = relationship(
+        "FinancialJob",
+        back_populates="company",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Company id={self.id} ticker={self.ticker!r} "
+            f"name={self.name!r} tenant={self.tenant_id}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Model: FinancialJob  (M2-Step 2)
+# ---------------------------------------------------------------------------
+
+
+class FinancialJob(Base):
+    """
+    A unit of work that extracts and exports financial data for a company.
+
+    Lifecycle (M2 Execution Plan, Section 2.3.3):
+      PENDING   → created via API; not yet dispatched to Celery.
+      QUEUED    → Celery task ID assigned; waiting for a worker.
+      RUNNING   → Worker has picked up the task and is processing.
+      COMPLETED → Extraction + export finished; result_url populated.
+      FAILED    → Worker raised an unhandled exception; error_message set.
+      CANCELLED → Cancelled by API request before or during processing.
+
+    Document storage:
+      document_url: S3 key of the source document uploaded by the user.
+      result_url:   S3 key of the Excel export (populated in M6).
+
+    Retention: Indefinite within the tenant workspace for audit purposes.
+    Engineering Spec Part 1, Section 1.2, Decision 3 — tenant_id isolation.
+    Engineering Spec Part 1, Section 1.2, Decision 4 — NO soft delete on jobs.
+      Jobs are terminal-state records; they are never deleted, only cancelled.
+    """
+
+    __tablename__ = "financial_jobs"
+
+    # ── Primary key ──────────────────────────────────────────────────────────
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=gen_uuid7,
+        doc="UUID v7 primary key — time-ordered for B-tree performance.",
+    )
+
+    # ── Tenancy ───────────────────────────────────────────────────────────────
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        doc="Owning tenant.  All job data is isolated per tenant.",
+    )
+
+    # ── Subject ───────────────────────────────────────────────────────────────
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=False,
+        doc="Company this job extracts data for.",
+    )
+
+    # ── Actor ────────────────────────────────────────────────────────────────
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        default=None,
+        doc=(
+            "User who created the job.  SET NULL on user deletion so the job "
+            "record is retained for audit and billing purposes."
+        ),
+    )
+
+    # ── Job classification ────────────────────────────────────────────────────
+    status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default=JobStatus.PENDING.value,
+        server_default=text("'pending'"),
+        doc=(
+            "Current lifecycle state.  Use JobStatus enum for comparisons. "
+            "Stored as VARCHAR(50) to allow future extension without ALTER TYPE."
+        ),
+    )
+    job_type: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        doc=(
+            "Identifies the extraction template to run.  "
+            "Examples: 'sec_10k_annual', 'sec_10q_quarterly'."
+        ),
+    )
+    fiscal_year: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        default=None,
+        doc="Fiscal year being extracted (e.g. 2023).  NULL for multi-year jobs.",
+    )
+
+    # ── Document references ───────────────────────────────────────────────────
+    document_url: Mapped[str | None] = mapped_column(
+        String(2000),
+        nullable=True,
+        default=None,
+        doc=(
+            "S3 key of the source document uploaded for this job.  "
+            "Set when the client confirms upload-complete.  "
+            "Format: {tenant_id}/jobs/{job_id}/{filename}"
+        ),
+    )
+    result_url: Mapped[str | None] = mapped_column(
+        String(2000),
+        nullable=True,
+        default=None,
+        doc=(
+            "S3 key of the generated Excel export.  "
+            "Populated by the export service in M6.  NULL until then."
+        ),
+    )
+
+    # ── Error state ───────────────────────────────────────────────────────────
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        default=None,
+        doc="Human-readable error description when status = FAILED.",
+    )
+
+    # ── Celery integration ────────────────────────────────────────────────────
+    celery_task_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        default=None,
+        doc=(
+            "Celery task ID assigned when the job is dispatched.  "
+            "Used to revoke in-progress tasks on cancel.  NULL until dispatched."
+        ),
+    )
+
+    # ── Timing ───────────────────────────────────────────────────────────────
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+        doc="Set when the worker begins processing (status → RUNNING).",
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+        doc=(
+            "Set when the job reaches a terminal state "
+            "(COMPLETED, FAILED, or CANCELLED)."
+        ),
+    )
+
+    # ── Timestamps ───────────────────────────────────────────────────────────
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=text("NOW()"),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=text("NOW()"),
+        onupdate=_utcnow,
+    )
+    # NOTE: No deleted_at — jobs are terminal-state records; they are cancelled,
+    # not deleted.  See class docstring.
+
+    # ── Table-level indexes ───────────────────────────────────────────────────
+    __table_args__ = (
+        # Primary tenant-scoped query — list all jobs for a workspace.
+        Index("ix_financial_jobs_tenant_id", "tenant_id"),
+        # Company-scoped query — list all jobs for a specific company.
+        Index("ix_financial_jobs_company_id", "company_id"),
+        # Status filter — find all pending/running jobs for monitoring.
+        Index("ix_financial_jobs_status", "status"),
+        # Creator lookup — "show me jobs I created".
+        Index("ix_financial_jobs_created_by", "created_by"),
+        # Timeline query — most-recent-first ordering for job list API.
+        Index("ix_financial_jobs_created_at", "created_at"),
+    )
+
+    # ── Relationships ─────────────────────────────────────────────────────────
+    tenant: Mapped[Tenant] = relationship(
+        "Tenant",
+        lazy="select",
+    )
+    company: Mapped[Company] = relationship(
+        "Company",
+        back_populates="jobs",
+        lazy="select",
+    )
+    creator: Mapped[User | None] = relationship(
+        "User",
+        foreign_keys=[created_by],
+        lazy="select",
+    )
+
+    @property
+    def is_terminal(self) -> bool:
+        """True if the job has reached a final state that cannot be changed."""
+        return self.status in (
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+        )
+
+    @property
+    def is_cancellable(self) -> bool:
+        """True if the job can still be cancelled via the API."""
+        return self.status in (
+            JobStatus.PENDING,
+            JobStatus.QUEUED,
+            JobStatus.RUNNING,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FinancialJob id={self.id} type={self.job_type!r} "
+            f"status={self.status!r} company={self.company_id}>"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Public exports — imported by Alembic env.py and repositories
 # ---------------------------------------------------------------------------
 
 __all__ = [
     "gen_uuid7",
     "UserRole",
+    "JobStatus",
     "Tenant",
     "User",
     "TenantMembership",
     "RefreshToken",
     "AuditLog",
+    "Company",
+    "FinancialJob",
 ]
