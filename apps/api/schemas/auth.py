@@ -9,6 +9,7 @@ Engineering Specification references:
 Milestone: M1-Step18 — POST /auth/register        ✓
            M1-Step19 — POST /auth/login            ✓
            M1-Step22 — POST /auth/forgot-password  ✓
+           M1-Step23 — POST /auth/reset-password   ✓
 Status:    COMPLETE
 """
 
@@ -118,6 +119,42 @@ class MessageResponse(BaseModel):
     """
 
     message: str = Field(description="Human-readable status message.")
+
+
+class ResetPasswordRequest(BaseModel):
+    """
+    Request body for POST /auth/reset-password.
+
+    ``token`` is the raw URL-safe value from the password reset email link.
+    The endpoint hashes it internally before the database lookup — the raw
+    token never touches the database.
+
+    ``new_password`` is validated against the same complexity policy as
+    registration: minimum 12 characters, uppercase, lowercase, digit, and
+    special character.
+    """
+
+    token: str = Field(
+        min_length=1,
+        description="Raw reset token from the email link query parameter.",
+    )
+    new_password: str = Field(
+        min_length=12,
+        description=(
+            "New plaintext password. Must meet complexity requirements: "
+            "12+ chars, uppercase, lowercase, digit, special character."
+        ),
+    )
+
+    @field_validator("new_password")
+    @classmethod
+    def _enforce_password_policy(cls, v: str) -> str:
+        """Apply the same complexity rules as registration."""
+        try:
+            validate_password_complexity(v)
+        except PasswordPolicyError as exc:
+            raise ValueError(exc.violations) from exc
+        return v
 
 
 class AuthResponse(BaseModel):

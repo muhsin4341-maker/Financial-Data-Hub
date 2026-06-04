@@ -20,6 +20,7 @@ Milestone: M1-Step18 — POST /auth/register        ✓
            M1-Step20 — POST /auth/refresh          ✓
            M1-Step21 — POST /auth/logout           ✓
            M1-Step22 — POST /auth/forgot-password  ✓
+           M1-Step23 — POST /auth/reset-password   ✓
 Status:    COMPLETE
 """
 
@@ -32,6 +33,7 @@ from typing import Any
 import structlog
 from slugify import slugify  # python-slugify
 from sqlalchemy import select
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.models import (
@@ -245,6 +247,94 @@ class AuthRepository:
             "auth.repository.password_reset_token_set",
             user_id=str(user.id),
             expires_at=expires_at.isoformat(),
+        )
+
+    async def get_user_by_reset_token_hash(self, token_hash: str) -> User | None:
+        """
+        Look up an active user whose ``password_reset_token`` matches the hash.
+
+        Used by the reset-password endpoint to verify the raw URL token from
+        the email link. The token column stores a SHA-256 hex digest; the
+        caller hashes the raw token before calling this method.
+
+        Returns ``None`` when:
+          - No user has this token hash (invalid token).
+          - The token was already cleared after use (``password_reset_token IS NULL``).
+          - The user has been soft-deleted.
+
+        Performance note: ``password_reset_token`` does not currently have a
+        dedicated index (low-frequency query; acceptable for M1). Add a partial
+        index if traffic warrants it in a later migration.
+
+        Args:
+            token_hash: SHA-256 hex digest of the raw URL token.
+
+        Returns:
+            ``User`` ORM instance if found, ``None`` otherwise.
+        """
+        result = await self._session.execute(
+            select(User).where(
+                User.password_reset_token == token_hash,
+                User.deleted_at.is_(None),
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def complete_password_reset(
+        self,
+        user: User,
+        new_password_hash: str,
+    ) -> None:
+        """
+        Apply the new password and invalidate the consumed reset token.
+
+        Three fields are updated atomically:
+          - ``password_hash``             — new bcrypt hash (cost factor 12)
+          - ``password_reset_token``      — set to NULL (token consumed; re-use rejected)
+          - ``password_reset_expires_at`` — set to NULL (housekeeping)
+
+        Setting the token to NULL ensures that a second attempt with the same
+        raw token returns ``None`` from ``get_user_by_reset_token_hash``,
+        preventing replay of the one-time link.
+
+        Args:
+            user:              The user completing the password reset.
+            new_password_hash: Pre-computed bcrypt hash from ``hash_password()``.
+        """
+        user.password_hash = new_password_hash
+        user.password_reset_token = None
+        user.password_reset_expires_at = None
+        await self._session.flush([user])
+        log.debug("auth.repository.password_reset_complete", user_id=str(user.id))
+
+    async def revoke_all_user_refresh_tokens(self, user_id: uuid.UUID) -> None:
+        """
+        Revoke every active refresh token for a user in a single bulk UPDATE.
+
+        Called after a password reset (and should be called after a forced
+        password change by an admin). Setting ``revoked_at`` on all rows
+        ensures that existing sessions cannot continue after the password
+        change — the user must re-authenticate with the new credentials.
+
+        Active tokens are those where ``revoked_at IS NULL``. Already-revoked
+        and expired tokens are left unchanged (they are already inert).
+
+        Args:
+            user_id: UUID of the user whose sessions are being terminated.
+        """
+        now = datetime.now(UTC)
+        await self._session.execute(
+            sa_update(RefreshToken)
+            .where(
+                RefreshToken.user_id == user_id,
+                RefreshToken.revoked_at.is_(None),
+            )
+            .values(revoked_at=now)
+        )
+        await self._session.flush()
+        log.debug(
+            "auth.repository.all_refresh_tokens_revoked",
+            user_id=str(user_id),
         )
 
     async def update_last_login(self, user: User) -> None:

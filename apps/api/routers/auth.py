@@ -12,16 +12,15 @@ Endpoints implemented:
   POST /api/v1/auth/refresh          — M1-Step20 ✓
   POST /api/v1/auth/logout           — M1-Step21 ✓
   POST /api/v1/auth/forgot-password  — M1-Step22 ✓
-
-Endpoints planned (future steps):
-  POST /api/v1/auth/reset-password   — M1-Step23
+  POST /api/v1/auth/reset-password   — M1-Step23 ✓
 
 Milestone: M1-Step18 — POST /auth/register        ✓
            M1-Step19 — POST /auth/login            ✓
            M1-Step20 — POST /auth/refresh          ✓
            M1-Step21 — POST /auth/logout           ✓
            M1-Step22 — POST /auth/forgot-password  ✓
-Status:    COMPLETE
+           M1-Step23 — POST /auth/reset-password   ✓
+Status:    COMPLETE — all M1 auth endpoints implemented
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api.core.config import get_settings
 from apps.api.core.database import get_db
 from apps.api.core.email import EmailMessage, get_email_backend, render_email_template
-from apps.api.core.exceptions import ConflictError, UnauthorizedError, ValidationError
+from apps.api.core.exceptions import APIError, ConflictError, UnauthorizedError, ValidationError
 from apps.api.core.security import (
     check_hibp_password,
     create_access_token,
@@ -58,6 +57,7 @@ from apps.api.schemas.auth import (
     LoginRequest,
     MessageResponse,
     RegisterRequest,
+    ResetPasswordRequest,
 )
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
@@ -831,3 +831,141 @@ async def forgot_password(
 
     # ── Step 3: Always return the same response ───────────────────────────────
     return MessageResponse(message=_FORGOT_PASSWORD_RESPONSE)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/auth/reset-password
+# ---------------------------------------------------------------------------
+
+_INVALID_RESET_TOKEN_MSG = "Password reset link is invalid or has expired."
+_RESET_SUCCESS_MSG = (
+    "Your password has been reset successfully. "
+    "Please log in with your new password."
+)
+
+
+@router.post(
+    "/reset-password",
+    response_model=MessageResponse,
+    status_code=200,
+    summary="Complete a password reset",
+    description=(
+        "Validates the one-time reset token from the email link, enforces "
+        "the password complexity policy, updates the password hash, and "
+        "revokes all existing refresh tokens to terminate active sessions."
+    ),
+)
+async def reset_password(
+    payload: ResetPasswordRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> MessageResponse:
+    """
+    Password reset flow:
+
+    1. Hash the raw URL token with SHA-256 and look up the matching User.
+       Returns 400 if no matching user is found (invalid or already-used token).
+    2. Verify the token has not expired (``password_reset_expires_at > now``).
+       Returns 400 if expired (same generic message — do not distinguish causes).
+    3. Hash the new password with bcrypt (cost 12 + SHA-256 prehash).
+    4. Persist the new password hash and clear the reset token fields:
+       ``password_reset_token`` and ``password_reset_expires_at`` set to NULL.
+       Setting to NULL invalidates the one-time link — re-use rejected.
+    5. Revoke all active refresh tokens for this user (bulk UPDATE).
+       A password change must terminate all existing sessions.
+    6. Write AuditLog entry (action="user.password_reset").
+    7. Send a "password changed" notification email (fail-open via
+       ConsoleEmailBackend in M1; SES/Resend in M8).
+    8. Return 200 MessageResponse.
+
+    Password complexity is enforced by the ``ResetPasswordRequest`` schema
+    validator (same rules as registration: 12 chars, U/L/D/S).
+
+    Security: identical 400 response for invalid, expired, and already-used
+    tokens prevents callers from determining the reason for rejection.
+    """
+    repo = AuthRepository(db)
+    settings = get_settings()
+
+    # ── Step 1: Validate token ────────────────────────────────────────────────
+    token_hash = hash_password_reset_token(payload.token)
+    user = await repo.get_user_by_reset_token_hash(token_hash)
+
+    if user is None:
+        raise APIError(
+            code="INVALID_RESET_TOKEN",
+            message=_INVALID_RESET_TOKEN_MSG,
+            status_code=400,
+        )
+
+    # ── Step 2: Check expiry ──────────────────────────────────────────────────
+    if (
+        user.password_reset_expires_at is None
+        or datetime.now(UTC) > user.password_reset_expires_at
+    ):
+        log.warning("auth.reset_password.token_expired", user_id=str(user.id))
+        raise APIError(
+            code="INVALID_RESET_TOKEN",
+            message=_INVALID_RESET_TOKEN_MSG,
+            status_code=400,
+        )
+
+    # ── Step 3: Hash the new password ─────────────────────────────────────────
+    new_password_hash = hash_password(payload.new_password)
+
+    # ── Step 4: Persist new password and clear the one-time token ─────────────
+    await repo.complete_password_reset(user=user, new_password_hash=new_password_hash)
+
+    # ── Step 5: Revoke all active refresh tokens ──────────────────────────────
+    # A password change must invalidate every existing session. The user
+    # must re-authenticate with their new credentials.
+    await repo.revoke_all_user_refresh_tokens(user.id)
+
+    # ── Step 6: Audit log ─────────────────────────────────────────────────────
+    membership = await repo.get_active_membership(user.id)
+    tenant_id = membership.tenant_id if membership else uuid.UUID(int=0)
+
+    await repo.create_audit_log(
+        tenant_id=tenant_id,
+        user_id=user.id,
+        action="user.password_reset",
+        entity_type="user",
+        entity_id=user.id,
+        ip_address=_client_ip(request),
+        user_agent=_client_ua(request),
+        request_id=_request_id(request),
+    )
+
+    # ── Step 7: Send "password changed" notification (fail-open) ─────────────
+    try:
+        from_address = (
+            f"{settings.email_from_name} <{settings.email_from_address}>"
+            if settings.email_from_name
+            else settings.email_from_address
+        )
+        notification_body = (
+            f"Hi {user.full_name},\n\n"
+            "Your Financial Data Hub password has been successfully reset.\n\n"
+            "If you did not make this change, contact support immediately — "
+            "your account may be compromised.\n\n"
+            "— The Financial Data Hub Team"
+        )
+        backend = get_email_backend(settings)
+        await backend.send(
+            EmailMessage(
+                to=user.email,
+                subject="Your Financial Data Hub password has been changed",
+                text_body=notification_body,
+                from_address=from_address,
+                from_name=settings.email_from_name,
+            )
+        )
+    except Exception:  # noqa: BLE001 — notification failure must not abort the reset
+        log.error(
+            "auth.reset_password.notification_failed",
+            user_id=str(user.id),
+        )
+
+    log.info("auth.reset_password.success", user_id=str(user.id))
+
+    return MessageResponse(message=_RESET_SUCCESS_MSG)
