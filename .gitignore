@@ -41,6 +41,6 @@ docker-compose.override.yml
 # AWS
 .aws/
 
-# Alembic
-db/migrations/versions/*.py
-!db/migrations/versions/.gitkeep
+# Alembic — migration files MUST be committed to source control.
+# The placeholder exclusion has been removed now that migration 001 exists.
+# db/migrations/versions/*.py  ← removed; Alembic revisions are source artefacts
