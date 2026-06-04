@@ -35,8 +35,8 @@ Architecture — two complementary layers:
      require_owner          — OWNER only
      get_current_user       — require_authenticated + DB lookup for User row
 
-Milestone: M1-Step14 — Auth middleware
-Status:    COMPLETE
+Milestone: M1-Step14 — Auth middleware (complete)
+          M2-TD1    — Redis JTI blocklist read wired (complete)
 """
 
 from __future__ import annotations
@@ -57,6 +57,42 @@ from apps.api.core.database import get_db
 from apps.api.core.exceptions import ForbiddenError, UnauthorizedError
 from apps.api.core.security import TokenPayload, verify_access_token
 from apps.api.models import User, UserRole
+
+# ---------------------------------------------------------------------------
+# Redis JTI blocklist check — TD-1
+# ---------------------------------------------------------------------------
+
+
+async def _is_jti_blocklisted(jti: str, redis_url: str) -> bool:
+    """
+    Return True if the given JWT ID (jti) is present in the Redis blocklist.
+
+    The blocklist is written by the logout and token-rotation endpoints with
+    key ``blocklist:{jti}`` and a TTL equal to the remaining access-token
+    lifetime.  A hit here means the token was explicitly revoked before its
+    natural expiry (i.e. the user logged out or rotated tokens).
+
+    Fails open: any Redis connectivity error returns False so that a Redis
+    outage does not lock out all authenticated users.  The access-token
+    lifetime (15 min) bounds the exposure window of any revoked token that
+    escapes the blocklist check.
+
+    Key format: ``blocklist:{jti}``  (matches the write in routers/auth.py)
+    """
+    try:
+        import redis.asyncio as aioredis  # noqa: PLC0415
+
+        client: aioredis.Redis = aioredis.from_url(  # type: ignore[no-untyped-call]
+            redis_url,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        value = await client.get(f"blocklist:{jti}")
+        await client.aclose()
+        return value is not None
+    except Exception:  # noqa: BLE001 — fail open; Redis outage must not block auth
+        logger.warning("auth.blocklist_check_failed", jti=jti)
+        return False
 
 logger = structlog.get_logger(__name__)
 
@@ -177,25 +213,37 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
             try:
                 payload = verify_access_token(raw_token, settings=settings)
 
-                ctx = AuthRequestContext(
-                    user_id=payload.sub,
-                    tenant_id=payload.tid,
-                    role=payload.role,
-                    jti=payload.jti,
-                    payload=payload,
-                )
-                request.state.auth_context = ctx
+                # ── TD-1: Redis JTI blocklist check ───────────────────────────
+                # Reject tokens that were explicitly revoked by logout or token
+                # rotation, even if the JWT signature and expiry are still valid.
+                # Fails open so a Redis outage cannot lock out authenticated users.
+                if await _is_jti_blocklisted(payload.jti, settings.redis_url):
+                    logger.warning(
+                        "auth.token_blocklisted",
+                        jti=payload.jti,
+                        path=request.url.path,
+                        method=request.method,
+                    )
+                else:
+                    ctx = AuthRequestContext(
+                        user_id=payload.sub,
+                        tenant_id=payload.tid,
+                        role=payload.role,
+                        jti=payload.jti,
+                        payload=payload,
+                    )
+                    request.state.auth_context = ctx
 
-                structlog.contextvars.bind_contextvars(
-                    user_id=str(payload.sub),
-                    tenant_id=str(payload.tid),
-                    role=payload.role,
-                )
-                logger.debug(
-                    "auth.token_valid",
-                    path=request.url.path,
-                    method=request.method,
-                )
+                    structlog.contextvars.bind_contextvars(
+                        user_id=str(payload.sub),
+                        tenant_id=str(payload.tid),
+                        role=payload.role,
+                    )
+                    logger.debug(
+                        "auth.token_valid",
+                        path=request.url.path,
+                        method=request.method,
+                    )
 
             except UnauthorizedError as exc:
                 # Invalid / expired token — log and continue with None context.
@@ -366,9 +414,6 @@ async def get_current_user(
     Use this when a route needs full ``User`` model attributes (e.g. email,
     TOTP state). Use ``require_authenticated`` when only the JWT payload
     context is needed — it avoids the DB round-trip.
-
-    TODO M1-Step16: Also check whether ``ctx.jti`` appears in the Redis
-    token blocklist to catch tokens invalidated by logout before expiry.
 
     Args:
         ctx: Resolved by ``require_authenticated`` — raises 401 if absent.

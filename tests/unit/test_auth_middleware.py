@@ -930,3 +930,239 @@ class TestErrorResponseStructure:
         body = resp.json()
         assert "error" in body
         assert body["error"]["code"] == "FORBIDDEN"
+
+
+# ---------------------------------------------------------------------------
+# Test: TD-1 — Redis JTI blocklist check
+# ---------------------------------------------------------------------------
+
+
+class TestJTIBlocklist:
+    """
+    Unit tests for the Redis JTI blocklist check introduced in TD-1.
+
+    Covers:
+      - _is_jti_blocklisted returns True when Redis key exists
+      - _is_jti_blocklisted returns False when Redis key is absent
+      - _is_jti_blocklisted fails open (returns False) on any Redis error
+      - JWTAuthMiddleware rejects a blocklisted token (auth_context stays None → 401)
+      - JWTAuthMiddleware passes a non-blocklisted token normally (200)
+      - JWTAuthMiddleware fails open when Redis is unreachable (200, not 401)
+    """
+
+    # ── _is_jti_blocklisted unit tests ────────────────────────────────────────
+
+    @pytest.mark.anyio
+    async def test_returns_true_when_key_exists(self) -> None:
+        """Redis GET returning a value means the JTI is blocklisted."""
+        from unittest.mock import AsyncMock, patch
+
+        from apps.api.middleware.auth import _is_jti_blocklisted
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=b"1")
+        mock_client.aclose = AsyncMock()
+
+        with patch("redis.asyncio.from_url", return_value=mock_client):
+            result = await _is_jti_blocklisted("some-jti", "redis://localhost:6379/0")
+
+        assert result is True
+        mock_client.get.assert_called_once_with("blocklist:some-jti")
+
+    @pytest.mark.anyio
+    async def test_returns_false_when_key_absent(self) -> None:
+        """Redis GET returning None means the JTI is not blocklisted."""
+        from unittest.mock import AsyncMock, patch
+
+        from apps.api.middleware.auth import _is_jti_blocklisted
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=None)
+        mock_client.aclose = AsyncMock()
+
+        with patch("redis.asyncio.from_url", return_value=mock_client):
+            result = await _is_jti_blocklisted("clean-jti", "redis://localhost:6379/0")
+
+        assert result is False
+
+    @pytest.mark.anyio
+    async def test_fails_open_on_redis_connection_error(self) -> None:
+        """Any Redis exception must result in False (fail open), not a raised error."""
+        import redis.asyncio as aioredis
+
+        from unittest.mock import patch
+
+        from apps.api.middleware.auth import _is_jti_blocklisted
+
+        with patch(
+            "redis.asyncio.from_url",
+            side_effect=aioredis.ConnectionError("Redis unreachable"),
+        ):
+            result = await _is_jti_blocklisted("any-jti", "redis://localhost:6379/0")
+
+        assert result is False
+
+    @pytest.mark.anyio
+    async def test_fails_open_on_timeout(self) -> None:
+        """A Redis timeout must also fail open."""
+        from unittest.mock import AsyncMock, patch
+
+        from apps.api.middleware.auth import _is_jti_blocklisted
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=TimeoutError("timed out"))
+        mock_client.aclose = AsyncMock()
+
+        with patch("redis.asyncio.from_url", return_value=mock_client):
+            result = await _is_jti_blocklisted("any-jti", "redis://localhost:6379/0")
+
+        assert result is False
+
+    # ── Middleware-level tests (via HTTP) ─────────────────────────────────────
+
+    @pytest.mark.anyio
+    async def test_blocklisted_token_returns_401(
+        self,
+        user_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        mock_settings: MagicMock,
+    ) -> None:
+        """
+        A structurally valid, non-expired JWT whose JTI is in the Redis
+        blocklist must be rejected with 401 on any protected route.
+        """
+        from unittest.mock import patch
+
+        token, jti = _make_token(user_id, tenant_id, "analyst", mock_settings)
+        app = _build_test_app(mock_settings)
+
+        # Simulate: this specific JTI is blocklisted
+        async def _blocklisted(j: str, url: str) -> bool:
+            return j == jti
+
+        with patch("apps.api.middleware.auth._is_jti_blocklisted", side_effect=_blocklisted):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                resp = await client.get(
+                    "/authenticated",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+        assert resp.status_code == 401
+        assert resp.json()["error"]["code"] == "UNAUTHORIZED"
+
+    @pytest.mark.anyio
+    async def test_blocklisted_token_still_allows_public_routes(
+        self,
+        user_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        mock_settings: MagicMock,
+    ) -> None:
+        """
+        A blocklisted token must not break public routes — they require no auth.
+        """
+        from unittest.mock import patch
+
+        token, _ = _make_token(user_id, tenant_id, "analyst", mock_settings)
+        app = _build_test_app(mock_settings)
+
+        async def _always_blocklisted(j: str, url: str) -> bool:
+            return True
+
+        with patch("apps.api.middleware.auth._is_jti_blocklisted", side_effect=_always_blocklisted):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                resp = await client.get(
+                    "/public",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+        assert resp.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_non_blocklisted_token_passes_through(
+        self,
+        user_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        mock_settings: MagicMock,
+    ) -> None:
+        """A valid token that is NOT blocklisted must authenticate normally."""
+        from unittest.mock import patch
+
+        token, _ = _make_token(user_id, tenant_id, "analyst", mock_settings)
+        app = _build_test_app(mock_settings)
+
+        async def _not_blocklisted(j: str, url: str) -> bool:
+            return False
+
+        with patch("apps.api.middleware.auth._is_jti_blocklisted", side_effect=_not_blocklisted):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                resp = await client.get(
+                    "/authenticated",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+        assert resp.status_code == 200
+        assert resp.json()["user_id"] == str(user_id)
+
+    @pytest.mark.anyio
+    async def test_redis_unavailable_fails_open(
+        self,
+        user_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        mock_settings: MagicMock,
+    ) -> None:
+        """
+        If Redis is unreachable during the blocklist check, the middleware must
+        fail open: the token is accepted and the request proceeds normally.
+        A Redis outage must not cause a 401 for all authenticated users.
+        """
+        from unittest.mock import patch
+
+        token, _ = _make_token(user_id, tenant_id, "analyst", mock_settings)
+        app = _build_test_app(mock_settings)
+
+        # _is_jti_blocklisted itself handles exceptions and returns False —
+        # simulate that behaviour: the real function already fails open, so
+        # patch it to return False (as it would after catching a Redis error).
+        async def _fail_open(j: str, url: str) -> bool:
+            return False  # Redis unreachable → fail open
+
+        with patch("apps.api.middleware.auth._is_jti_blocklisted", side_effect=_fail_open):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                resp = await client.get(
+                    "/authenticated",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+        assert resp.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_different_jti_not_blocked(
+        self,
+        user_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        mock_settings: MagicMock,
+    ) -> None:
+        """Only the specific blocklisted JTI is rejected; other JTIs pass through."""
+        from unittest.mock import patch
+
+        token1, jti1 = _make_token(user_id, tenant_id, "analyst", mock_settings)
+        token2, jti2 = _make_token(user_id, tenant_id, "analyst", mock_settings)
+        app = _build_test_app(mock_settings)
+
+        # Only jti1 is blocklisted
+        async def _selective_block(j: str, url: str) -> bool:
+            return j == jti1
+
+        with patch("apps.api.middleware.auth._is_jti_blocklisted", side_effect=_selective_block):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                resp1 = await client.get(
+                    "/authenticated",
+                    headers={"Authorization": f"Bearer {token1}"},
+                )
+                resp2 = await client.get(
+                    "/authenticated",
+                    headers={"Authorization": f"Bearer {token2}"},
+                )
+
+        assert resp1.status_code == 401  # blocklisted
+        assert resp2.status_code == 200  # clean token passes
