@@ -23,6 +23,7 @@ from apps.api.middleware.audit import AuditMiddleware
 from apps.api.middleware.auth import JWTAuthMiddleware
 from apps.api.middleware.rate_limit import RateLimitMiddleware
 from apps.api.routers.auth import router as auth_router
+from apps.api.routers.companies import router as companies_router
 
 log = structlog.get_logger(__name__)
 
@@ -171,8 +172,8 @@ def create_app() -> FastAPI:
         }
 
     # ── Routers (added per milestone) ────────────────────────────────────────
-    app.include_router(auth_router)   # M1-Steps 18-23
-    # TODO M2: include companies router
+    app.include_router(auth_router)      # M1-Steps 18-23
+    app.include_router(companies_router) # M2-Step 6
     # TODO M2: include jobs router
     # TODO M6: include exports router
 
