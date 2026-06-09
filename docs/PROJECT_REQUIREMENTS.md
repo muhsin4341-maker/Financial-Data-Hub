@@ -224,7 +224,6 @@ Normalize:
 - Date formats
 - Reporting standards (IFRS, US GAAP, local accounting standards, Indian Accounting Standards)
 
-
 ---
 
 ### Excel Export Requirements
