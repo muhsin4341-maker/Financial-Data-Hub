@@ -13,37 +13,45 @@ See `/docs/` or the Engineering Specification Parts 1–3 in the project documen
 
 ## Quick Start
 
+> **Windows / PowerShell users:** all commands below are PowerShell-safe.
+> `&&` is not valid in PowerShell 5.1 — use the forms shown here.
+> `psql` and `alembic` are not installed locally; they run inside Docker.
+
 ### 1. Environment
-```bash
-cp .env.example .env
+```powershell
+Copy-Item .env.example .env
 # Fill in required values (see .env.example comments)
 ```
 
 ### 2. Start local services
-```bash
+```powershell
 docker compose up -d
 ```
 
 ### 3. Run database migrations
-```bash
-cd db && alembic upgrade head
+```powershell
+docker compose exec api alembic -c db/alembic.ini upgrade head
 ```
 
 ### 4. Seed reference data
-```bash
-psql $DATABASE_URL -f db/seeds/canonical_fields.sql
-psql $DATABASE_URL -f db/seeds/field_aliases.sql
-psql $DATABASE_URL -f db/seeds/source_configs.sql
+```powershell
+Get-Content db/seeds/canonical_fields.sql | docker compose exec -T db psql -U fdh -d fdh
+Get-Content db/seeds/field_aliases.sql    | docker compose exec -T db psql -U fdh -d fdh
+Get-Content db/seeds/source_configs.sql   | docker compose exec -T db psql -U fdh -d fdh
 ```
 
 ### 5. Start API (development)
-```bash
-cd apps/api && uvicorn main:app --reload --port 8000
+The API runs inside Docker — no local uvicorn needed:
+```powershell
+docker compose up -d
+# API is available at http://localhost:8000
+# Logs: docker compose logs -f api
 ```
 
 ### 6. Start frontend (development)
-```bash
-cd apps/web && npm run dev
+```powershell
+cd apps/web
+npm run dev
 ```
 
 ## Phase 1 Scope

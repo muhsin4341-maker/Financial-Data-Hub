@@ -1,2 +1,18 @@
-# TODO M8: user_invitation plain-text email template
-{{ subject }}
+You have been invited to join {{ app_name }}
+
+Hello,
+
+You have been invited to join {{ app_name }} as {{ role }}.
+
+To accept this invitation, click the link below:
+
+  {{ accept_link }}
+
+This invitation link expires in {{ expiry_hours }} hours.
+
+If you did not expect this invitation, you can safely ignore this email.
+No account will be created unless you click the link above.
+
+--
+{{ app_name }}
+This is an automated message. Please do not reply to this email.

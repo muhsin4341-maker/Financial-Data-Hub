@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     aws_secret_access_key: str = ""
     aws_region: str = "us-east-1"
     aws_endpoint_url: str | None = None  # None = real AWS; set for LocalStack
+    # When set, pre-signed URLs have their host rewritten to this base URL.
+    # Required in Docker dev: S3 client uses http://localstack:4566 internally
+    # but the browser must reach LocalStack via http://localhost:4566.
+    s3_presigned_url_base: str | None = None
 
     # S3 Buckets
     s3_documents_bucket: str = "fdh-documents-dev"

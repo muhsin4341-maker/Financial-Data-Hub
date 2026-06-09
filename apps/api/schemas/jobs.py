@@ -7,18 +7,27 @@ Engineering Specification references:
   M2 Execution Plan, Section 6.4   — pagination contract
 
 Schemas:
-  JobCreate         — POST /api/v1/jobs request body
-  JobUpdate         — internal update model (status transitions, not a public PATCH body)
-  JobResponse       — full read model returned by create, list, and detail endpoints
-  JobListResponse   — paginated list envelope for GET /api/v1/jobs
-  JobStatusResponse — lightweight status-only response for GET /api/v1/jobs/{id}/status
+  JobCreate            — POST /api/v1/jobs request body
+  JobUpdate            — internal update model (status transitions, not a public PATCH body)
+  JobResponse          — full read model returned by create, list, and detail endpoints
+  JobListResponse      — paginated list envelope for GET /api/v1/jobs
+  JobStatusResponse    — lightweight status-only response for GET /api/v1/jobs/{id}/status
+  UploadUrlRequest     — POST /api/v1/jobs/{id}/upload-url request body
+  UploadUrlResponse    — pre-signed URL envelope
+  UploadCompleteRequest — POST /api/v1/jobs/{id}/upload-complete request body (M4.4)
 
 Status lifecycle (M2 Execution Plan, Section 2.3.3):
   pending → queued → running → completed
                              → failed
   pending/queued/running → cancelled (via API cancel request)
 
-Milestone: M2-Step 4
+M4.4 change:
+  UploadCompleteRequest extended with optional extraction context fields
+  (fiscal_period, filing_date_iso, reporting_standard) so that the router
+  can pass accurate metadata to process_pdf_extraction_task without requiring
+  a separate API call or a second job-update round-trip.
+
+Milestone: M2-Step 4 / M4.4
 """
 
 from __future__ import annotations
@@ -28,7 +37,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 from apps.api.models import JobStatus
 
@@ -210,6 +219,7 @@ class JobResponse(BaseModel):
 
     # ── Computed convenience fields ───────────────────────────────────────────
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def is_terminal(self) -> bool:
         """True if the job has reached a final state (completed/failed/cancelled)."""
@@ -219,6 +229,7 @@ class JobResponse(BaseModel):
             JobStatus.CANCELLED,
         )
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def is_cancellable(self) -> bool:
         """True if the job can still be cancelled via the API."""
@@ -253,6 +264,120 @@ class JobListResponse(BaseModel):
             page_size = data.get("page_size", 1)
             data["pages"] = math.ceil(total / page_size) if page_size else 0
         return data
+
+
+# ---------------------------------------------------------------------------
+# S3 upload schemas (Step 8)
+# ---------------------------------------------------------------------------
+
+
+class UploadUrlRequest(BaseModel):
+    """
+    Request body for POST /api/v1/jobs/{id}/upload-url.
+
+    The filename is sanitised server-side before embedding in the S3 key.
+    """
+
+    filename: str = Field(
+        min_length=1,
+        max_length=255,
+        description=(
+            "Original filename of the source document "
+            "(e.g. 'annual_report_2023.pdf').  "
+            "Sanitised before use in the S3 key."
+        ),
+        examples=["annual_report_2023.pdf", "10-K_2023.pdf"],
+    )
+
+
+class UploadUrlResponse(BaseModel):
+    """
+    Response from POST /api/v1/jobs/{id}/upload-url.
+
+    The client should:
+      1. HTTP PUT the document body to ``url``.
+      2. Call POST /api/v1/jobs/{id}/upload-complete with the ``key``.
+    """
+
+    url: str = Field(
+        description=(
+            "Pre-signed S3 PUT URL.  "
+            "Valid for ``expires_in`` seconds from generation time."
+        )
+    )
+    key: str = Field(
+        description=(
+            "S3 object key.  "
+            "Pass this value to POST /jobs/{id}/upload-complete."
+        )
+    )
+    expires_in: int = Field(
+        description="URL validity in seconds (900 = 15 minutes)."
+    )
+
+
+class UploadCompleteRequest(BaseModel):
+    """
+    Request body for POST /api/v1/jobs/{id}/upload-complete.
+
+    The ``key`` must match the value returned by the preceding upload-url call.
+    The server validates the key prefix against ``{tenant_id}/jobs/{job_id}/``
+    to prevent arbitrary key injection.
+
+    M4.4 — Extraction context fields:
+      The three optional fields below are forwarded directly to
+      process_pdf_extraction_task so the Celery worker has accurate metadata
+      without requiring a second API call.  All three default to safe values
+      when omitted:
+        fiscal_period      — defaults to 'FY' (annual).
+        filing_date_iso    — defaults to today's date in the router.
+        reporting_standard — defaults to 'US_GAAP'.
+
+    These fields are intentionally optional so that the client-side contract
+    is non-breaking: existing callers that only send ``key`` continue to work
+    exactly as before; the defaults produce valid extraction parameters.
+    """
+
+    key: str = Field(
+        min_length=1,
+        max_length=2000,
+        description=(
+            "S3 object key as returned by POST /jobs/{id}/upload-url.  "
+            "Must start with ``{tenant_id}/jobs/{job_id}/``."
+        ),
+    )
+
+    # ── Extraction context — M4.4 ─────────────────────────────────────────────
+    # Forwarded to process_pdf_extraction_task by the upload_complete handler.
+    fiscal_period: str | None = Field(
+        default=None,
+        max_length=10,
+        description=(
+            "Fiscal period label for the uploaded document: "
+            "'FY', 'Q1', 'Q2', 'Q3', or 'Q4'.  "
+            "Defaults to 'FY' (annual) when omitted."
+        ),
+        examples=["FY", "Q3", None],
+    )
+    filing_date_iso: str | None = Field(
+        default=None,
+        description=(
+            "Date the document was filed with the regulator, in ISO 8601 format "
+            "(YYYY-MM-DD).  "
+            "Defaults to today's date when omitted."
+        ),
+        examples=["2024-02-02", None],
+    )
+    reporting_standard: str | None = Field(
+        default=None,
+        max_length=20,
+        description=(
+            "Accounting standard of the uploaded document: "
+            "'US_GAAP', 'IFRS', or 'IND_AS'.  "
+            "Defaults to 'US_GAAP' when omitted."
+        ),
+        examples=["US_GAAP", "IFRS", "IND_AS", None],
+    )
 
 
 class JobStatusResponse(BaseModel):

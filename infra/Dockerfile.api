@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 # System dependencies
 RUN apt-get update && apt-get install -y \
@@ -13,10 +13,14 @@ RUN pip install uv
 WORKDIR /app
 
 # Copy dependency files first (layer caching)
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock ./
 
-# Install dependencies
-RUN uv sync --no-dev
+# Install directly into system Python — avoids .venv being overwritten
+# by the bind mount (- .:/app) at container runtime
+RUN uv pip install --system . flower
+
+# Verify install — build fails here if celery or uvicorn is missing
+RUN celery --version && uvicorn --version
 
 # Copy application code
 COPY . .

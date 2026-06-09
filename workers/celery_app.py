@@ -4,14 +4,17 @@ Celery application factory and task routing configuration.
 Engineering Spec Part 2, Section 9.3.
 Milestone: M0 (configuration) / M2 (first tasks added)
 """
+import os
+
 from celery import Celery
 from workers.queues import (
     QUEUE_AI, QUEUE_COMPUTE, QUEUE_DEFAULT, QUEUE_EXPORT, QUEUE_FETCH
 )
 
-# TODO M1: Import settings and use settings.redis_celery_broker_url
-BROKER_URL = "redis://localhost:6379/1"
-RESULT_BACKEND = "redis://localhost:6379/2"
+# Read from environment variables injected by docker-compose / k8s.
+# Fallback to localhost for local dev without Docker.
+BROKER_URL = os.environ.get("REDIS_CELERY_BROKER_URL", "redis://localhost:6379/1")
+RESULT_BACKEND = os.environ.get("REDIS_CELERY_RESULT_BACKEND", "redis://localhost:6379/2")
 
 
 def create_celery() -> Celery:
@@ -38,8 +41,9 @@ def create_celery() -> Celery:
         task_routes={
             "workers.tasks.acquisition_tasks.*":  {"queue": QUEUE_FETCH},
             "workers.tasks.ingestion_tasks.*":    {"queue": QUEUE_FETCH},
-            "workers.tasks.extraction_tasks.*":   {"queue": QUEUE_AI},
-            "workers.tasks.validation_tasks.*":   {"queue": QUEUE_COMPUTE},
+            "workers.tasks.extraction_tasks.*":    {"queue": QUEUE_AI},
+            "workers.tasks.fx_translation_task.*": {"queue": QUEUE_COMPUTE},
+            "workers.tasks.validation_tasks.*":    {"queue": QUEUE_COMPUTE},
             "workers.tasks.export_tasks.*":       {"queue": QUEUE_EXPORT},
             "workers.tasks.notification_tasks.*": {"queue": QUEUE_DEFAULT},
         },

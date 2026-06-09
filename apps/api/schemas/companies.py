@@ -8,10 +8,11 @@ Engineering Specification references:
   M2 Execution Plan, Section 6.4   — pagination contract: items, total, page, page_size, pages
 
 Schemas:
-  CompanyCreate       — POST /api/v1/companies request body
-  CompanyUpdate       — PATCH /api/v1/companies/{id} request body (all fields optional)
-  CompanyResponse     — read model returned for single-company responses
-  CompanyListResponse — paginated list envelope for GET /api/v1/companies
+  CompanyCreate         — POST /api/v1/companies request body
+  CompanyUpdate         — PATCH /api/v1/companies/{id} request body (all fields optional)
+  CompanyResponse       — read model returned for single-company responses
+  CompanyListResponse   — paginated list envelope for GET /api/v1/companies
+  CompanyResolveResponse — GET /api/v1/companies/resolve response (M3.2)
 
 Validation highlights:
   - Ticker is uppercased and stripped (normalised at input).
@@ -19,7 +20,9 @@ Validation highlights:
   - Website URL is length-constrained to match the VARCHAR(500) column.
   - Ticker and name have minimum length of 1 (non-empty string).
 
-Milestone: M2-Step 4
+Milestones:
+  M2-Step 4  — CompanyCreate, CompanyUpdate, CompanyResponse, CompanyListResponse
+  M3.2       — CompanyResolveResponse
 """
 
 from __future__ import annotations
@@ -319,3 +322,49 @@ class CompanyListResponse(BaseModel):
             page_size = data.get("page_size", 1)
             data["pages"] = math.ceil(total / page_size) if page_size else 0
         return data
+
+
+# ---------------------------------------------------------------------------
+# Company Resolver response (M3.2)
+# ---------------------------------------------------------------------------
+
+
+class CompanyResolveResponse(BaseModel):
+    """
+    Response schema for GET /api/v1/companies/resolve.
+
+    Returns canonical company identification data resolved from an external
+    provider (SEC EDGAR for US tickers). Cached in Redis by the resolver
+    service; the response always reflects the most recently cached or freshly
+    resolved values.
+
+    Milestone: M3.2 — Company Resolver
+    """
+
+    ticker: str = Field(
+        description="Normalised uppercase ticker symbol (e.g. 'AAPL').",
+        examples=["AAPL"],
+    )
+    company_name: str = Field(
+        description="Full legal company name from the data provider.",
+        examples=["Apple Inc."],
+    )
+    cik: str = Field(
+        description=(
+            "SEC Central Index Key — 10-digit zero-padded string. "
+            "Primary identifier for SEC EDGAR filing lookups."
+        ),
+        examples=["0000320193"],
+    )
+    exchange: str | None = Field(
+        default=None,
+        description=(
+            "Primary listing exchange when available (e.g. 'Nasdaq', 'NYSE'). "
+            "None when the data provider does not return exchange information."
+        ),
+        examples=["Nasdaq", None],
+    )
+    country: str = Field(
+        description="ISO 3166-1 alpha-2 country code of the primary regulator.",
+        examples=["US"],
+    )

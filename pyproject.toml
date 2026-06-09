@@ -35,6 +35,7 @@ dependencies = [
     "jinja2>=3.1.0",
     "resend>=0.8.0",
     # Document processing (Phase 1 — XBRL primary)
+    "lxml>=5.2.0",
     "pdfplumber>=0.11.0",
     "pymupdf>=1.24.0",
     # Logging / monitoring

@@ -1,5 +1,5 @@
 """
-Companies router — CRUD endpoints for company management.
+Companies router — CRUD + resolver endpoints for company management.
 
 Engineering Specification references:
   M2 Execution Plan, Section 2.2   — companies API endpoints
@@ -8,11 +8,12 @@ Engineering Specification references:
   M2 Execution Plan, Section 9.5   — role-based access control (partial M2 enforcement)
 
 Endpoints:
-  POST   /api/v1/companies          — Create company (role >= analyst)
-  GET    /api/v1/companies          — List companies with pagination + search (any auth)
-  GET    /api/v1/companies/{id}     — Get company by ID (any auth)
-  PATCH  /api/v1/companies/{id}     — Update company (role >= analyst)
-  DELETE /api/v1/companies/{id}     — Soft-delete company (role >= admin)
+  POST   /api/v1/companies               — Create company (role >= analyst)
+  GET    /api/v1/companies               — List companies with pagination + search (any auth)
+  GET    /api/v1/companies/resolve       — Resolve ticker/CIK to canonical info (any auth) [M3.2]
+  GET    /api/v1/companies/{id}          — Get company by ID (any auth)
+  PATCH  /api/v1/companies/{id}          — Update company (role >= analyst)
+  DELETE /api/v1/companies/{id}          — Soft-delete company (role >= admin)
 
 Authorization (Section 9.5):
   - POST / PATCH : require_analyst  (ANALYST, ADMIN, or OWNER)
@@ -25,13 +26,16 @@ Tenant isolation:
   request body.  The repository enforces the isolation on every query.
 
 Error codes:
-  404 COMPANY_NOT_FOUND   — company does not exist or belongs to another tenant
-  409 CONFLICT            — ticker already exists in this tenant workspace
-  422 VALIDATION_ERROR    — request body fails Pydantic validation
-  401 UNAUTHORIZED        — missing or invalid JWT
-  403 FORBIDDEN           — authenticated but insufficient role
+  404 COMPANY_NOT_FOUND       — company does not exist or belongs to another tenant
+  404 COMPANY_INFO_NOT_FOUND  — ticker/CIK not found in resolver (M3.2)
+  409 CONFLICT                — ticker already exists in this tenant workspace
+  422 VALIDATION_ERROR        — request body fails Pydantic validation
+  401 UNAUTHORIZED            — missing or invalid JWT
+  403 FORBIDDEN               — authenticated but insufficient role
 
-Milestone: M2-Step 6
+Milestones:
+  M2-Step 6  — CRUD endpoints
+  M3.2       — GET /companies/resolve
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core.config import get_settings
 from apps.api.core.database import get_db
 from apps.api.core.exceptions import ConflictError, NotFoundError
 from apps.api.middleware.auth import (
@@ -56,9 +61,11 @@ from apps.api.repositories.companies import CompanyRepository
 from apps.api.schemas.companies import (
     CompanyCreate,
     CompanyListResponse,
+    CompanyResolveResponse,
     CompanyResponse,
     CompanyUpdate,
 )
+from services.acquisition.company_resolver.resolver import CompanyResolverService
 
 log = structlog.get_logger(__name__)
 
@@ -183,6 +190,122 @@ async def list_companies(
         is_active=is_active,
     )
     return _to_list_response(items, total, page, page_size)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/companies/resolve  (M3.2 — Company Resolver)
+# ---------------------------------------------------------------------------
+
+# NOTE: This route MUST be registered before /{company_id} so that FastAPI
+# matches the literal path segment "resolve" before attempting UUID parsing.
+
+
+async def _get_resolver() -> CompanyResolverService:
+    """
+    FastAPI dependency that provides a CompanyResolverService.
+
+    Lazily creates a Redis client using the application settings. Redis is
+    fail-open — if unreachable, resolution proceeds without cache. Override
+    this dependency in tests by calling app.dependency_overrides.
+    """
+    settings = get_settings()
+    redis_client = None
+    try:
+        import redis.asyncio as aioredis  # noqa: PLC0415
+
+        redis_client = aioredis.from_url(  # type: ignore[no-untyped-call]
+            settings.redis_url,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+    except Exception:  # noqa: BLE001
+        pass  # fail-open: proceed without cache
+
+    return CompanyResolverService(
+        redis_client=redis_client,
+        user_agent=settings.edgar_user_agent,
+    )
+
+
+@router.get(
+    "/resolve",
+    response_model=CompanyResolveResponse,
+    status_code=200,
+    summary="Resolve a ticker or CIK to canonical company information",
+    description=(
+        "Look up a company by ticker symbol or SEC CIK.  "
+        "Results are resolved via SEC EDGAR and cached in Redis (TTL 24 h).  "
+        "Exactly one of ``ticker`` or ``cik`` must be provided.  "
+        "Returns 404 if the identifier is not found in the resolver registry."
+    ),
+)
+async def resolve_company(
+    ticker: str | None = Query(
+        default=None,
+        description=(
+            "Stock ticker symbol to resolve (e.g. 'AAPL'). "
+            "Case-insensitive; normalised to uppercase."
+        ),
+        examples=["AAPL"],
+    ),
+    cik: str | None = Query(
+        default=None,
+        description=(
+            "SEC Central Index Key to resolve (e.g. '0000320193' or '320193'). "
+            "Zero-padded to 10 digits internally."
+        ),
+        examples=["0000320193"],
+    ),
+    ctx: AuthRequestContext = Depends(require_authenticated),  # noqa: ARG001
+    resolver: CompanyResolverService = Depends(_get_resolver),
+) -> CompanyResolveResponse:
+    """
+    Resolve a ticker or CIK to canonical company information.
+
+    Exactly one of ``ticker`` or ``cik`` must be provided. Supplying both
+    or neither returns a 422 validation error.
+
+    Steps:
+      1. Validate that exactly one identifier is provided.
+      2. Check Redis cache (company:ticker:{T} or company:cik:{C}).
+      3. On cache miss, delegate to SECCompanyResolver → SEC EDGAR APIs.
+      4. Write result to cache; return CompanyResolveResponse.
+      5. Return 404 if the identifier cannot be resolved.
+    """
+    if ticker is None and cik is None:
+        from apps.api.core.exceptions import ValidationError  # noqa: PLC0415
+        raise ValidationError(
+            "Provide exactly one of 'ticker' or 'cik' as a query parameter."
+        )
+    if ticker is not None and cik is not None:
+        from apps.api.core.exceptions import ValidationError  # noqa: PLC0415
+        raise ValidationError(
+            "Provide exactly one of 'ticker' or 'cik', not both."
+        )
+
+    if ticker is not None:
+        info = await resolver.resolve_by_ticker(ticker)
+        identifier = ticker.upper()
+    else:
+        info = await resolver.resolve_by_cik(cik)  # type: ignore[arg-type]
+        identifier = cik  # type: ignore[assignment]
+
+    if info is None:
+        raise NotFoundError("CompanyInfo", identifier)
+
+    log.info(
+        "company.resolved",
+        ticker=info.ticker,
+        cik=info.cik,
+        company_name=info.company_name,
+    )
+    return CompanyResolveResponse(
+        ticker=info.ticker,
+        company_name=info.company_name,
+        cik=info.cik,
+        exchange=info.exchange,
+        country=info.country,
+    )
 
 
 # ---------------------------------------------------------------------------

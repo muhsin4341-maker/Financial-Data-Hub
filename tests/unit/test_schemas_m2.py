@@ -595,9 +595,12 @@ class TestInvitationResponse:
             tenant_id=uuid.uuid4(),
             invitee_email="bob@example.com",
             role="analyst",
+            status="pending",
             invited_by_id=uuid.uuid4(),
-            invitation_expires_at=_NOW,
+            expires_at=_NOW,
+            accepted_at=None,
             created_at=_NOW,
+            updated_at=_NOW,
         )
         assert r.invitee_email == "bob@example.com"
         assert r.role == "analyst"
@@ -608,13 +611,16 @@ class TestInvitationResponse:
             tenant_id=uuid.uuid4(),
             invitee_email="alice@example.com",
             role="viewer",
+            status="pending",
             invited_by_id=uuid.uuid4(),
-            invitation_expires_at=_NOW,
+            expires_at=_NOW,
+            accepted_at=None,
             created_at=_NOW,
+            updated_at=_NOW,
         )
         data = r.model_dump()
         assert "invitee_email" in data
-        assert "invitation_expires_at" in data
+        assert "expires_at" in data
 
 
 # ===========================================================================

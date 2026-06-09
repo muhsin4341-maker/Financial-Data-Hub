@@ -1,2 +1,55 @@
-<!-- TODO M8: user_invitation HTML email template -->
-<html><body><p>{{ subject }}</p></body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>You're invited to {{ app_name }}</title>
+</head>
+<body style="font-family: Arial, sans-serif; background-color: #f4f4f4; margin: 0; padding: 20px;">
+  <table width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0"
+               style="background: #ffffff; border-radius: 6px; padding: 40px;">
+          <tr>
+            <td>
+              <h1 style="color: #1F3864; font-size: 24px; margin-top: 0;">
+                You've been invited to {{ app_name }}
+              </h1>
+              <p style="color: #404040; font-size: 16px; line-height: 1.6;">
+                You have been invited to join <strong>{{ app_name }}</strong>
+                as <strong>{{ role }}</strong>.
+              </p>
+              <p style="text-align: center; margin: 32px 0;">
+                <a href="{{ accept_link }}"
+                   style="background-color: #2E5496; color: #ffffff;
+                          padding: 14px 28px; border-radius: 4px;
+                          text-decoration: none; font-size: 16px;
+                          font-weight: bold; display: inline-block;">
+                  Accept Invitation
+                </a>
+              </p>
+              <p style="color: #606060; font-size: 14px;">
+                Or copy and paste this link into your browser:
+              </p>
+              <p style="color: #606060; font-size: 13px; word-break: break-all;">
+                {{ accept_link }}
+              </p>
+              <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 32px 0;">
+              <p style="color: #808080; font-size: 13px;">
+                This invitation expires in <strong>{{ expiry_hours }} hours</strong>.
+                If you did not expect this invitation, you can safely ignore this
+                email — no account will be created unless you click the link above.
+              </p>
+              <p style="color: #808080; font-size: 12px;">
+                This is an automated message from {{ app_name }}.
+                Please do not reply to this email.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

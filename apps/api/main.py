@@ -22,8 +22,17 @@ from apps.api.core.exceptions import APIError, api_error_handler
 from apps.api.middleware.audit import AuditMiddleware
 from apps.api.middleware.auth import JWTAuthMiddleware
 from apps.api.middleware.rate_limit import RateLimitMiddleware
+from apps.api.routers.acquisition import router as acquisition_router
 from apps.api.routers.auth import router as auth_router
 from apps.api.routers.companies import router as companies_router
+from apps.api.routers.export import router as export_router
+from apps.api.routers.filings import company_filings_router, filings_router
+from apps.api.routers.invitations import router as invitations_router
+from apps.api.routers.jobs import router as jobs_router
+from apps.api.routers.admin import router as admin_router
+from apps.api.routers.analytics import router as analytics_router
+from apps.api.routers.financials import router as financials_router
+from apps.api.routers.sources import router as sources_router
 
 log = structlog.get_logger(__name__)
 
@@ -172,10 +181,18 @@ def create_app() -> FastAPI:
         }
 
     # ── Routers (added per milestone) ────────────────────────────────────────
-    app.include_router(auth_router)      # M1-Steps 18-23
-    app.include_router(companies_router) # M2-Step 6
-    # TODO M2: include jobs router
-    # TODO M6: include exports router
+    app.include_router(auth_router)             # M1-Steps 18-23
+    app.include_router(companies_router)        # M2-Step 6
+    app.include_router(jobs_router)             # M2-Step 7
+    app.include_router(invitations_router)      # M2-Step 9
+    app.include_router(sources_router)          # M3.1 — Source Registry
+    app.include_router(acquisition_router)      # M3.8 — Acquisition APIs
+    app.include_router(filings_router)          # M3.8 — Filing APIs
+    app.include_router(company_filings_router)  # M3.8 — Company filing APIs
+    app.include_router(export_router)           # M6.4 — Excel export download
+    app.include_router(financials_router)        # M5.7 — Financial line-item ledger
+    app.include_router(analytics_router)        # M7.1 — Analytics & trends
+    app.include_router(admin_router)            # B3   — Admin FX sync endpoint
 
     return app
 

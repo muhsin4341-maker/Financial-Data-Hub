@@ -473,6 +473,43 @@ def generate_refresh_token_expiry(*, settings: Settings | None = None) -> dateti
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Invitation token  (M2 Execution Plan, Section 9.4)
+# ---------------------------------------------------------------------------
+
+
+def generate_invitation_token() -> str:
+    """
+    Generate a cryptographically secure invitation token.
+
+    Same pattern and entropy as the password reset token (288 bits,
+    URL-safe base64).  The raw value is placed in the invitation link
+    email; the database stores only its SHA-256 hash.
+
+    Returns:
+        A 48-character URL-safe base64 string (288 bits of entropy).
+    """
+    raw = secrets.token_bytes(36)  # 288 bits
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def hash_invitation_token(raw_token: str) -> str:
+    """
+    Compute the SHA-256 hex digest of a raw invitation token.
+
+    The ``invitations.token_hash`` column stores this digest.  On receipt
+    of an accept / validate / resend / cancel request, hash the URL token
+    and compare against the stored value.
+
+    Args:
+        raw_token: The raw URL-safe base64 token from the invitation link.
+
+    Returns:
+        A 64-character lowercase SHA-256 hex digest.
+    """
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
 def generate_password_reset_token() -> str:
     """
     Generate a cryptographically secure password reset token.
@@ -678,6 +715,9 @@ __all__ = [
     "generate_raw_refresh_token",
     "hash_refresh_token",
     "generate_refresh_token_expiry",
+    # Invitation token
+    "generate_invitation_token",
+    "hash_invitation_token",
     # Password reset token
     "generate_password_reset_token",
     "hash_password_reset_token",

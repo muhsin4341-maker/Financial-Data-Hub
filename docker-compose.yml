@@ -3,6 +3,18 @@ x-api-common: &api-common
     context: .
     dockerfile: infra/Dockerfile.api
   env_file: .env
+  environment:
+    DATABASE_URL: postgresql+asyncpg://fdh:fdh_password@db:5432/fdh
+    DATABASE_URL_SYNC: postgresql://fdh:fdh_password@db:5432/fdh
+    REDIS_URL: redis://redis:6379/0
+    REDIS_CELERY_BROKER_URL: redis://redis:6379/1
+    REDIS_CELERY_RESULT_BACKEND: redis://redis:6379/2
+    # LocalStack: API containers reach it via Docker service name
+    AWS_ENDPOINT_URL: http://localstack:4566
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    # Pre-signed URLs must use localhost:4566 so the browser can reach LocalStack
+    S3_PRESIGNED_URL_BASE: http://localhost:4566
   volumes:
     - .:/app
   depends_on:
@@ -51,7 +63,7 @@ services:
 
   # ── LocalStack (S3 emulation) ────────────────────────────────────────────────
   localstack:
-    image: localstack/localstack:latest
+    image: localstack/localstack:3
     ports:
       - "4566:4566"
     environment:
@@ -62,6 +74,7 @@ services:
       AWS_SECRET_ACCESS_KEY: test
     volumes:
       - localstack_data:/var/lib/localstack
+      - ./infra/localstack-init:/etc/localstack/init
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:4566/_localstack/health || exit 1"]
       interval: 10s
@@ -115,6 +128,7 @@ services:
       - /app/.next
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000
+      API_INTERNAL_URL: http://api:8000
       NODE_ENV: development
     restart: unless-stopped
 

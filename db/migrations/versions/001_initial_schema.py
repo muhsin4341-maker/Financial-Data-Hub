@@ -20,7 +20,10 @@ Enum types:
 
 Engineering Specification references:
   Part 1, Section 1.2, Decision 1  — UUID v7 PKs (generated in Python; no DB default needed)
-  Part 1, Section 1.2, Decision 2  — NUMERIC(20,4) for financial values (future tables)
+  Amendment V1.2, Section 1.1      — NUMERIC(26,2) for absolute monetary values (revenue,
+                                     assets, liabilities, net_income, cash_flow lines);
+                                     NUMERIC(38,10) for per-share metrics, financial ratios,
+                                     and forex translation coefficients (future tables)
   Part 1, Section 1.2, Decision 3  — Shared schema; tenant_id on all user-data tables
   Part 1, Section 1.2, Decision 4  — Soft delete via deleted_at TIMESTAMPTZ
   Part 1, Table 4                   — AuditLog: append-only, 7-year retention, ONDELETE RESTRICT

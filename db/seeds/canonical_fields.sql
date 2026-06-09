@@ -1,6 +1,6 @@
 -- Canonical field definitions — source of truth for all extraction and export.
 -- Engineering Spec Part 2, Section 5.3.
--- Run once after alembic upgrade head.
+-- Idempotent: safe to re-run; duplicate field_keys are silently skipped.
 
 -- ── Income Statement (22 fields) ─────────────────────────────────────────────
 INSERT INTO canonical_fields (field_key, display_name, statement_type, section, sign_convention, is_required, description) VALUES
@@ -25,7 +25,8 @@ INSERT INTO canonical_fields (field_key, display_name, statement_type, section, 
 ('diluted_shares',                   'Diluted Shares Outstanding (M)',       'income', 'per_share',   1,  true,  'Weighted average diluted shares outstanding (millions)'),
 ('depreciation_amortization',        'Depreciation & Amortization',         'income', 'non_cash',    1,  true,  'D&A from income statement or notes to financial statements'),
 ('ebitda',                           'EBITDA',                               'income', 'computed',    1,  true,  'Computed: operating_income + depreciation_amortization'),
-('ebit',                             'EBIT',                                 'income', 'computed',    1,  true,  'Computed: same as operating_income');
+('ebit',                             'EBIT',                                 'income', 'computed',    1,  true,  'Computed: same as operating_income')
+ON CONFLICT (field_key) DO NOTHING;
 
 -- ── Balance Sheet (28 fields) ────────────────────────────────────────────────
 INSERT INTO canonical_fields (field_key, display_name, statement_type, section, sign_convention, is_required, description) VALUES
@@ -56,7 +57,8 @@ INSERT INTO canonical_fields (field_key, display_name, statement_type, section, 
 ('accumulated_other_comprehensive_income', 'AOCI',                           'balance_sheet', 'equity',             1, false, 'Accumulated other comprehensive income/(loss)'),
 ('treasury_stock',                   'Treasury Stock',                       'balance_sheet', 'equity',            -1, false, 'Cost of repurchased shares (negative value)'),
 ('total_equity',                     'Total Stockholders Equity',            'balance_sheet', 'equity',             1, true,  'Total equity including all components'),
-('total_liabilities_and_equity',     'Total Liabilities & Equity',           'balance_sheet', 'total',              1, true,  'Must equal total_assets exactly (BS-001)');
+('total_liabilities_and_equity',     'Total Liabilities & Equity',           'balance_sheet', 'total',              1, true,  'Must equal total_assets exactly (BS-001)')
+ON CONFLICT (field_key) DO NOTHING;
 
 -- ── Cash Flow Statement (21 fields) ──────────────────────────────────────────
 INSERT INTO canonical_fields (field_key, display_name, statement_type, section, sign_convention, is_required, description) VALUES
@@ -80,4 +82,5 @@ INSERT INTO canonical_fields (field_key, display_name, statement_type, section, 
 ('net_cash_from_financing',          'Net Cash from Financing',              'cash_flow', 'financing', 1, true,  'Total financing cash flow'),
 ('effect_of_exchange_rate',          'FX Effect on Cash',                    'cash_flow', 'fx',        1, false, 'Effect of exchange rate changes on cash'),
 ('net_change_in_cash',               'Net Change in Cash',                   'cash_flow', 'total',     1, true,  'Net movement in cash and equivalents (CF-001 check)'),
-('free_cash_flow',                   'Free Cash Flow',                       'cash_flow', 'computed',  1, true,  'Computed: net_cash_from_operations + capital_expenditures');
+('free_cash_flow',                   'Free Cash Flow',                       'cash_flow', 'computed',  1, true,  'Computed: net_cash_from_operations + capital_expenditures')
+ON CONFLICT (field_key) DO NOTHING;
